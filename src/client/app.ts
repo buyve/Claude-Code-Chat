@@ -62,6 +62,7 @@ import type {
   CCSession,
 } from "../shared/types.ts";
 import { emptyHotlist } from "../shared/types.ts";
+import { createPresenceWatcher } from "../cc-integration/presence.ts";
 import type { ChatState } from "./widgets/chat.ts";
 
 // --- App state ---
@@ -483,8 +484,17 @@ export function startApp() {
   });
   state.connection = conn;
 
+  // Start CC session presence watcher
+  const presenceWatcher = createPresenceWatcher();
+  presenceWatcher.onChange((status, rich) => {
+    conn.send({ type: "presence", status, rich });
+    renderAll(layout, state);
+  });
+  presenceWatcher.start();
+
   // Cleanup on exit
   function cleanup() {
+    presenceWatcher.stop();
     conn.close();
     if (state.mouseEnabled) disableMouse();
     process.stdin.setRawMode(false);
