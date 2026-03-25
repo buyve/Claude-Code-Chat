@@ -28,6 +28,6 @@ if (args[0] === "server") {
   process.exit(0);
 }
 
-// TODO: start client (Task 1.8)
-console.log("Client mode not yet implemented.");
-process.exit(0);
+// Start client
+import { startApp } from "../src/client/app.ts";
+startApp();
