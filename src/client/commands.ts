@@ -14,7 +14,7 @@ export interface CommandResult {
 export type ServerAction =
   | { type: "join"; channel: string }
   | { type: "part"; channel: string; message?: string }
-  | { type: "dm"; to: string; content: string }
+  | { type: "dm"; nick: string; content: string }
   | { type: "nick"; nick: string }
   | { type: "dnd" }
   | { type: "action"; channel: string; content: string };
@@ -100,7 +100,7 @@ export function handleCommand(
       const content = args.slice(spaceIdx + 1);
       return {
         type: "system",
-        serverAction: { type: "dm", to, content },
+        serverAction: { type: "dm", nick: to, content },
         messages: [sysMsg(`DM to ${to}: ${content}`)],
       };
     }
