@@ -12,6 +12,7 @@ import {
 } from "./auth.ts";
 import { createStore, type Store } from "./store.ts";
 import { createChannelManager, type ChannelManager } from "./channels.ts";
+import { createPresenceManager, type PresenceManager } from "./presence.ts";
 import { decodeMessage, encodeMessage } from "../shared/protocol.ts";
 import type { ClientMessage } from "../shared/protocol.ts";
 import type { Message, User } from "../shared/types.ts";
@@ -26,7 +27,8 @@ interface ServerState {
   auth: AuthState;
   store: Store;
   channels: ChannelManager;
-  lastPong: Map<string, number>; // ws id -> timestamp
+  presence: PresenceManager;
+  lastPong: Map<string, number>;
 }
 
 function createServerState(dbPath?: string): ServerState {
@@ -35,6 +37,7 @@ function createServerState(dbPath?: string): ServerState {
     auth: createAuthState(),
     store,
     channels: createChannelManager(store),
+    presence: createPresenceManager(),
     lastPong: new Map(),
   };
 }
@@ -90,7 +93,18 @@ export function startServer(dbPath?: string) {
         const user = removeConnection(ws, state.auth);
         state.lastPong.delete(ws.data.id);
         if (user) {
-          // Broadcast part messages for all channels the user was in
+          // Start grace period before marking offline
+          state.presence.disconnect(user.id, (userId) => {
+            const userChannels = state.channels.getUserChannels(userId);
+            for (const ch of userChannels) {
+              broadcast(state, ch, encodeMessage({
+                type: "presence_update",
+                userId,
+                status: "offline",
+              }));
+            }
+          });
+
           const userChannels = state.channels.getUserChannels(user.id);
           for (const ch of userChannels) {
             state.channels.part(user, ch);
@@ -146,6 +160,10 @@ function handleMessage(
     if (user) {
       // Persist nick
       state.store.setNick(user.id, user.nick);
+
+      // Init/restore presence
+      state.presence.reconnect(user.id);
+      state.presence.update(user.id, "online");
 
       ws.send(encodeMessage({ type: "auth_ok", user }));
 
