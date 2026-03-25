@@ -1,5 +1,7 @@
 // Core domain types for CCC
 
+export type BufferType = "channel" | "dm" | "cc_session";
+
 export type MessageType =
   | "chat"
   | "action"
@@ -57,6 +59,15 @@ export interface Channel {
   topic: string;
   members: string[]; // user ids
   hotlist: HotlistEntry;
+}
+
+export interface CCSession {
+  id: string;
+  project: string;
+  language?: string;
+  cwd: string;
+  startedAt: number; // unix ms
+  active: boolean;
 }
 
 export function emptyHotlist(): HotlistEntry {

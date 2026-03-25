@@ -5,7 +5,7 @@ import chalk from "chalk";
 import stringWidth from "string-width";
 import type { Region } from "../layout.ts";
 import { fitToWidth } from "../layout.ts";
-import type { Message } from "../../shared/types.ts";
+import type { Message, CCSession } from "../../shared/types.ts";
 import {
   getPrefix,
   nickColor,
@@ -184,4 +184,45 @@ export function renderChat(region: Region, state: ChatState) {
 // Is chat scrolled to bottom?
 export function isAtBottom(state: ChatState): boolean {
   return state.scrollOffset === 0;
+}
+
+// Render CC session placeholder when a CC buffer is active
+export function renderCCSessionPlaceholder(region: Region, session: CCSession) {
+  region.clear();
+  const midRow = Math.floor(region.h / 2);
+
+  const title = chalk.bold.cyan(`[CC Session: ${session.project}]`);
+  const cwd = chalk.dim(`cwd: ${session.cwd}`);
+  const lang = session.language ? chalk.dim(`language: ${session.language}`) : "";
+  const elapsed = session.startedAt
+    ? chalk.dim(`started: ${formatDuration(Date.now() - session.startedAt)}`)
+    : "";
+  const status = session.active
+    ? chalk.green("● Active")
+    : chalk.red("○ Inactive");
+
+  const border = chalk.dim("─".repeat(Math.min(40, region.w - 4)));
+  const note = chalk.dim("CC SDK integration coming in Phase 3");
+
+  const lines = [border, "", title, status, "", cwd, lang, elapsed, "", border, "", note].filter(
+    (l) => l !== undefined,
+  );
+  const startRow = Math.max(0, midRow - Math.floor(lines.length / 2));
+
+  for (let i = 0; i < lines.length; i++) {
+    const row = startRow + i;
+    if (row >= region.h) break;
+    // Center each line
+    const lineW = stringWidth(lines[i]!);
+    const pad = Math.max(0, Math.floor((region.w - lineW) / 2));
+    region.writeLine(row, " ".repeat(pad) + lines[i]!);
+  }
+}
+
+function formatDuration(ms: number): string {
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  const remainMins = minutes % 60;
+  return `${hours}h ${remainMins}m ago`;
 }

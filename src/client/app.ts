@@ -10,9 +10,13 @@ import {
 } from "./layout.ts";
 import { renderTitlebar } from "./widgets/titlebar.ts";
 import { renderStatusbar } from "./widgets/statusbar.ts";
-import { renderBuflist, adjustScroll } from "./widgets/buflist.ts";
-import { renderChat, computeNickWidth, isAtBottom } from "./widgets/chat.ts";
-import { renderNicklist } from "./widgets/nicklist.ts";
+import {
+  renderBuflist,
+  adjustBuflistScroll,
+  type BuflistEntry,
+} from "./widgets/buflist.ts";
+import { renderChat, computeNickWidth, isAtBottom, renderCCSessionPlaceholder } from "./widgets/chat.ts";
+import { renderNicklist, renderCCSessionMeta } from "./widgets/nicklist.ts";
 import {
   renderInput,
   createHistory,
@@ -44,7 +48,13 @@ import {
   type Action,
 } from "./keybindings.ts";
 import { handleCommand, COMMANDS } from "./commands.ts";
-import type { Channel, Message, User } from "../shared/types.ts";
+import type {
+  Channel,
+  Message,
+  User,
+  BufferType,
+  CCSession,
+} from "../shared/types.ts";
 import { emptyHotlist } from "../shared/types.ts";
 import type { ChatState } from "./widgets/chat.ts";
 
@@ -56,6 +66,8 @@ interface BufferState {
   chatScroll: number;
   readMarkerIndex: number;
   history: History;
+  bufferType: BufferType;
+  ccSession?: CCSession; // only for cc_session buffers
 }
 
 interface AppState {
@@ -105,14 +117,77 @@ function createDummyMessages(channel: string, selfNick: string): Message[] {
   return msgs;
 }
 
+function createDummyCCSessions(): CCSession[] {
+  return [
+    {
+      id: "session-1",
+      project: "ccc",
+      language: "TypeScript",
+      cwd: `${process.env["HOME"] ?? "/home/user"}/projects/CCC`,
+      startedAt: Date.now() - 45 * 60000, // 45 min ago
+      active: true,
+    },
+    {
+      id: "session-2",
+      project: "api-server",
+      language: "Go",
+      cwd: `${process.env["HOME"] ?? "/home/user"}/projects/api-server`,
+      startedAt: Date.now() - 120 * 60000, // 2h ago
+      active: true,
+    },
+  ];
+}
+
 function createBuffers(selfNick: string): BufferState[] {
+  const buffers: BufferState[] = [];
+
+  // Channels
   const channels = ["#general", "#dev", "#help"];
-  return channels.map((name) => ({
-    channel: { name, topic: name === "#general" ? "General chat" : name === "#dev" ? "Dev talk" : "Help", members: [], hotlist: emptyHotlist() },
-    messages: createDummyMessages(name, selfNick),
-    chatScroll: 0,
-    readMarkerIndex: -1,
-    history: createHistory(),
+  for (const name of channels) {
+    buffers.push({
+      channel: {
+        name,
+        topic: name === "#general" ? "General chat" : name === "#dev" ? "Dev talk" : "Help",
+        members: [],
+        hotlist: emptyHotlist(),
+      },
+      messages: createDummyMessages(name, selfNick),
+      chatScroll: 0,
+      readMarkerIndex: -1,
+      history: createHistory(),
+      bufferType: "channel",
+    });
+  }
+
+  // CC Sessions (dummy)
+  const sessions = createDummyCCSessions();
+  for (const session of sessions) {
+    buffers.push({
+      channel: {
+        name: `⚡${session.project}`,
+        topic: `CC Session — ${session.cwd}`,
+        members: [],
+        hotlist: emptyHotlist(),
+      },
+      messages: [],
+      chatScroll: 0,
+      readMarkerIndex: -1,
+      history: createHistory(),
+      bufferType: "cc_session",
+      ccSession: session,
+    });
+  }
+
+  return buffers;
+}
+
+// Build buflist entries from buffers
+function buildBuflistEntries(buffers: BufferState[]): BuflistEntry[] {
+  return buffers.map((buf, i) => ({
+    name: buf.channel.name,
+    bufferType: buf.bufferType,
+    channel: buf.channel,
+    globalIndex: i,
   }));
 }
 
@@ -120,6 +195,7 @@ function createBuffers(selfNick: string): BufferState[] {
 
 function renderAll(layout: Layout, state: AppState) {
   const buf = state.buffers[state.activeIndex]!;
+  const isCC = buf.bufferType === "cc_session";
 
   renderTitlebar(layout.titlebar, {
     channel: buf.channel.name,
@@ -128,34 +204,47 @@ function renderAll(layout: Layout, state: AppState) {
 
   renderStatusbar(layout.statusbar, {
     nick: state.selfNick,
-    status: "Local",
+    status: isCC ? "CC Session" : "Local",
     channel: buf.channel.name,
   });
 
-  const buflistState = {
-    channels: state.buffers.map((b) => b.channel),
+  const entries = buildBuflistEntries(state.buffers);
+  const buflistScroll = adjustBuflistScroll(
+    entries,
+    state.activeIndex,
+    0,
+    layout.buflist.h,
+  );
+  renderBuflist(layout.buflist, {
+    entries,
     activeIndex: state.activeIndex,
-    scrollOffset: adjustScroll(
-      { channels: state.buffers.map((b) => b.channel), activeIndex: state.activeIndex, scrollOffset: 0 },
-      layout.buflist.h,
-    ),
-  };
-  renderBuflist(layout.buflist, buflistState);
-
-  const chatState: ChatState = {
-    messages: buf.messages,
-    selfNick: state.selfNick,
-    nickWidth: computeNickWidth(buf.messages),
-    scrollOffset: buf.chatScroll,
-    readMarkerIndex: buf.readMarkerIndex,
-    isActive: true,
-  };
-  renderChat(layout.chat, chatState);
-
-  renderNicklist(layout.nicklist, {
-    users: state.users,
-    scrollOffset: 0,
+    scrollOffset: buflistScroll,
   });
+
+  // Chat area: CC session placeholder or normal chat
+  if (isCC && buf.ccSession) {
+    renderCCSessionPlaceholder(layout.chat, buf.ccSession);
+  } else {
+    const chatState: ChatState = {
+      messages: buf.messages,
+      selfNick: state.selfNick,
+      nickWidth: computeNickWidth(buf.messages),
+      scrollOffset: buf.chatScroll,
+      readMarkerIndex: buf.readMarkerIndex,
+      isActive: true,
+    };
+    renderChat(layout.chat, chatState);
+  }
+
+  // Nicklist: CC session metadata or normal nicklist
+  if (isCC && buf.ccSession) {
+    renderCCSessionMeta(layout.nicklist, buf.ccSession);
+  } else {
+    renderNicklist(layout.nicklist, {
+      users: state.users,
+      scrollOffset: 0,
+    });
+  }
 
   layout.render(); // borders
 
@@ -247,14 +336,11 @@ function switchBuffer(state: AppState, index: number) {
 function addMessage(state: AppState, bufferIndex: number, msg: Message) {
   const buf = state.buffers[bufferIndex]!;
   buf.messages.push(msg);
-  // Auto-scroll if at bottom
-  if (buf.chatScroll === 0) {
-    // Already at bottom, stay there
-  }
 }
 
 function handleAction(action: Action, layout: Layout, state: AppState) {
   const buf = state.buffers[state.activeIndex]!;
+  const isCC = buf.bufferType === "cc_session";
 
   // Quit confirmation mode
   if (state.quitting) {
@@ -285,12 +371,16 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
       switchBuffer(state, Math.min(state.buffers.length - 1, state.activeIndex + 1));
       break;
 
-    // Chat scroll
+    // Chat scroll (only for non-CC buffers)
     case "page_up":
-      buf.chatScroll = Math.min(buf.chatScroll + layout.chat.h, buf.messages.length);
+      if (!isCC) {
+        buf.chatScroll = Math.min(buf.chatScroll + layout.chat.h, buf.messages.length);
+      }
       break;
     case "page_down":
-      buf.chatScroll = Math.max(0, buf.chatScroll - layout.chat.h);
+      if (!isCC) {
+        buf.chatScroll = Math.max(0, buf.chatScroll - layout.chat.h);
+      }
       break;
 
     // Mouse
@@ -299,10 +389,14 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
       if (state.mouseEnabled) enableMouse(); else disableMouse();
       break;
     case "mouse_scroll_up":
-      buf.chatScroll = Math.min(buf.chatScroll + 3, buf.messages.length);
+      if (!isCC) {
+        buf.chatScroll = Math.min(buf.chatScroll + 3, buf.messages.length);
+      }
       break;
     case "mouse_scroll_down":
-      buf.chatScroll = Math.max(0, buf.chatScroll - 3);
+      if (!isCC) {
+        buf.chatScroll = Math.max(0, buf.chatScroll - 3);
+      }
       break;
     case "mouse_click": {
       const bounds = {
@@ -313,9 +407,12 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
       };
       const region = identifyRegion(action.col, action.row, bounds);
       if (region === "buflist") {
-        const clickedIndex = action.row - layout.buflist.y;
-        if (clickedIndex >= 0 && clickedIndex < state.buffers.length) {
-          switchBuffer(state, clickedIndex);
+        // Need to map visual row to actual buffer index
+        const entries = buildBuflistEntries(state.buffers);
+        const clickRow = action.row - layout.buflist.y;
+        const clickedEntry = resolveClickedBuffer(entries, clickRow);
+        if (clickedEntry !== null) {
+          switchBuffer(state, clickedEntry);
         }
       }
       break;
@@ -325,12 +422,11 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
     case "ctrl_c":
     case "ctrl_d": {
       state.quitting = true;
-      // Show confirmation in input area
       state.inputState = { text: "", cursor: 0, prompt: "Really quit CCC? (y/N) " };
       break;
     }
 
-    // Input editing
+    // Input editing (disabled for CC session buffers — no chat input)
     case "char":
       state.inputState = insertChar(state.inputState, action.ch);
       break;
@@ -383,7 +479,6 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
     // Tab completion
     case "tab": {
       if (state.completionCtx) {
-        // Cycle through candidates
         state.completionCtx.cycleIndex++;
         const result = applyCompletion(state.inputState.text, state.completionCtx);
         state.inputState = { ...state.inputState, text: result.text, cursor: result.cursor };
@@ -404,6 +499,11 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
     case "enter": {
       const text = state.inputState.text.trim();
       if (!text) break;
+
+      // CC session buffers don't accept chat input (Phase 3 will pipe to CC subprocess)
+      if (isCC) {
+        break;
+      }
 
       historyAdd(buf.history, text);
 
@@ -445,4 +545,27 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
     default:
       break;
   }
+}
+
+// Resolve a clicked row in the buflist to a buffer global index
+function resolveClickedBuffer(entries: BuflistEntry[], clickRow: number): number | null {
+  // Reconstruct the visual lines to map clickRow to an entry
+  const sectionOrder: BufferType[] = ["channel", "dm", "cc_session"];
+  let lineIndex = 0;
+
+  for (const section of sectionOrder) {
+    const sectionEntries = entries.filter((e) => e.bufferType === section);
+    if (sectionEntries.length === 0) continue;
+
+    // Section header line
+    if (lineIndex === clickRow) return null; // clicked on header
+    lineIndex++;
+
+    for (const entry of sectionEntries) {
+      if (lineIndex === clickRow) return entry.globalIndex;
+      lineIndex++;
+    }
+  }
+
+  return null;
 }

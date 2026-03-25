@@ -1,8 +1,8 @@
-// Buflist widget — channel/DM list with hotlist counters
+// Buflist widget — 3-section buffer list: Channels, DMs, CC Sessions
 
 import chalk from "chalk";
 import type { Region } from "../layout.ts";
-import type { Channel, HotlistPriority } from "../../shared/types.ts";
+import type { Channel, HotlistPriority, BufferType } from "../../shared/types.ts";
 import { hotlistMax } from "../../shared/types.ts";
 import {
   hotlistStyle,
@@ -10,11 +10,27 @@ import {
   SCROLL_INDICATOR,
 } from "../theme.ts";
 
+export interface BuflistEntry {
+  name: string;
+  bufferType: BufferType;
+  channel: Channel;
+  globalIndex: number; // index in the flat buffers array
+}
+
 export interface BuflistState {
-  channels: Channel[];
-  activeIndex: number;
+  entries: BuflistEntry[];
+  activeIndex: number; // global index of active buffer
   scrollOffset: number;
 }
+
+// Section headers
+const SECTION_HEADERS: Record<BufferType, string> = {
+  channel: "📂 Channels",
+  dm: "💬 DMs",
+  cc_session: "⚡ CC Sessions",
+};
+
+const SECTION_ORDER: BufferType[] = ["channel", "dm", "cc_session"];
 
 function formatHotlist(ch: Channel): string {
   const h = ch.hotlist;
@@ -25,54 +41,96 @@ function formatHotlist(ch: Channel): string {
   return parts.length > 0 ? ` (${parts.join(",")})` : "";
 }
 
+interface RenderedLine {
+  text: string;
+  isHeader: boolean;
+}
+
+function buildLines(entries: BuflistEntry[], activeIndex: number): RenderedLine[] {
+  const lines: RenderedLine[] = [];
+
+  for (const section of SECTION_ORDER) {
+    const sectionEntries = entries.filter((e) => e.bufferType === section);
+    if (sectionEntries.length === 0) continue;
+
+    // Section header
+    lines.push({
+      text: ` ${chalk.dim(SECTION_HEADERS[section])}`,
+      isHeader: true,
+    });
+
+    for (const entry of sectionEntries) {
+      const num = `${entry.globalIndex + 1}.`;
+      const hotlist = formatHotlist(entry.channel);
+      const priority = hotlistMax(entry.channel.hotlist);
+
+      let line = ` ${num} ${entry.name}${hotlist}`;
+
+      if (entry.globalIndex === activeIndex) {
+        line = ACTIVE_BUFFER_STYLE(line);
+      } else if (priority > 0) {
+        line = hotlistStyle(priority as HotlistPriority)(line);
+      }
+
+      lines.push({ text: line, isHeader: false });
+    }
+  }
+
+  return lines;
+}
+
 export function renderBuflist(region: Region, state: BuflistState) {
   region.clear();
-  const { channels, activeIndex, scrollOffset } = state;
+  const lines = buildLines(state.entries, state.activeIndex);
   const visibleRows = region.h;
+  const { scrollOffset } = state;
 
-  // Scroll indicators
   const hasUp = scrollOffset > 0;
-  const hasDown = scrollOffset + visibleRows < channels.length;
+  const hasDown = scrollOffset + visibleRows < lines.length;
 
   for (let row = 0; row < visibleRows; row++) {
     const idx = scrollOffset + row;
-    if (idx >= channels.length) break;
-
-    const ch = channels[idx]!;
-    const num = `${idx + 1}.`;
-    const hotlist = formatHotlist(ch);
-    const name = ch.name;
-    const priority = hotlistMax(ch.hotlist);
-
-    let line = ` ${num} ${name}${hotlist}`;
-
-    if (idx === activeIndex) {
-      line = ACTIVE_BUFFER_STYLE(line);
-    } else if (priority > 0) {
-      line = hotlistStyle(priority as HotlistPriority)(line);
-    }
-
-    region.writeLine(row, line);
+    if (idx >= lines.length) break;
+    region.writeLine(row, lines[idx]!.text);
   }
 
-  // Overflow indicators
   if (hasUp) {
-    const indicator = SCROLL_INDICATOR("▲ more");
-    region.writeLine(0, ` ${indicator}`);
+    region.writeLine(0, ` ${SCROLL_INDICATOR("▲ more")}`);
   }
   if (hasDown) {
-    const indicator = SCROLL_INDICATOR("▼ more");
-    region.writeLine(visibleRows - 1, ` ${indicator}`);
+    region.writeLine(visibleRows - 1, ` ${SCROLL_INDICATOR("▼ more")}`);
   }
 }
 
-// Ensure active buffer is visible
-export function adjustScroll(state: BuflistState, visibleRows: number): number {
-  let { activeIndex, scrollOffset } = state;
-  if (activeIndex < scrollOffset) {
-    scrollOffset = activeIndex;
-  } else if (activeIndex >= scrollOffset + visibleRows) {
-    scrollOffset = activeIndex - visibleRows + 1;
+// Ensure active buffer is visible — returns adjusted scroll offset
+export function adjustBuflistScroll(
+  entries: BuflistEntry[],
+  activeIndex: number,
+  scrollOffset: number,
+  visibleRows: number,
+): number {
+  const lines = buildLines(entries, activeIndex);
+  // Find the line index for the active buffer
+  let activeLine = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i]!.isHeader) {
+      // Check if this line corresponds to the active entry
+      const entry = entries.find(
+        (e) =>
+          e.globalIndex === activeIndex &&
+          lines[i]!.text.includes(`${activeIndex + 1}.`),
+      );
+      if (entry) {
+        activeLine = i;
+        break;
+      }
+    }
+  }
+
+  if (activeLine < scrollOffset) {
+    scrollOffset = activeLine;
+  } else if (activeLine >= scrollOffset + visibleRows) {
+    scrollOffset = activeLine - visibleRows + 1;
   }
   return scrollOffset;
 }

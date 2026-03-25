@@ -1,8 +1,9 @@
 // Nicklist widget — grouped by presence, alphabetical within group
+// Also shows CC session metadata when a CC buffer is active
 
 import chalk from "chalk";
 import type { Region } from "../layout.ts";
-import type { User, PresenceStatus } from "../../shared/types.ts";
+import type { User, PresenceStatus, CCSession } from "../../shared/types.ts";
 import { nickColor, INACTIVE_DIM, SCROLL_INDICATOR } from "../theme.ts";
 
 // Presence icons — emoji with ASCII fallback
@@ -86,4 +87,50 @@ export function renderNicklist(region: Region, state: NicklistState) {
 
   if (hasUp) region.writeLine(0, ` ${SCROLL_INDICATOR("▲")}`);
   if (hasDown) region.writeLine(visibleRows - 1, ` ${SCROLL_INDICATOR("▼")}`);
+}
+
+// Render CC session metadata in the nicklist area
+export function renderCCSessionMeta(region: Region, session: CCSession) {
+  region.clear();
+
+  const lines: string[] = [];
+  lines.push(chalk.dim("── Session Info ──"));
+  lines.push("");
+  lines.push(chalk.bold.cyan(`⚡ ${session.project}`));
+  lines.push("");
+
+  if (session.language) {
+    lines.push(chalk.white(` Lang: ${session.language}`));
+  }
+  lines.push(chalk.white(` Dir:  ${shortenPath(session.cwd)}`));
+
+  const elapsed = Date.now() - session.startedAt;
+  const mins = Math.floor(elapsed / 60000);
+  const hrs = Math.floor(mins / 60);
+  const durStr = hrs > 0 ? `${hrs}h ${mins % 60}m` : `${mins}m`;
+  lines.push(chalk.white(` Time: ${durStr}`));
+
+  lines.push("");
+  lines.push(
+    session.active
+      ? chalk.green(" ● Active")
+      : chalk.red(" ○ Inactive"),
+  );
+
+  for (let row = 0; row < Math.min(lines.length, region.h); row++) {
+    region.writeLine(row, ` ${lines[row]!}`);
+  }
+}
+
+function shortenPath(cwd: string): string {
+  const home = process.env["HOME"] ?? "";
+  if (home && cwd.startsWith(home)) {
+    return "~" + cwd.slice(home.length);
+  }
+  // Just last 2 segments if too long
+  const parts = cwd.split("/");
+  if (parts.length > 3) {
+    return ".../" + parts.slice(-2).join("/");
+  }
+  return cwd;
 }
