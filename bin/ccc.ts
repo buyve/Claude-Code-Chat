@@ -23,9 +23,12 @@ if (args.includes("--version") || args.includes("-v")) {
 }
 
 if (args[0] === "server") {
-  // TODO: start server (Phase 2)
-  console.log("Server mode not yet implemented.");
-  process.exit(0);
+  const { startServer } = await import("../src/server/index.ts");
+  const dbPath = process.env["CCC_DB_PATH"];
+  const noPersist = args.includes("--no-persist");
+  startServer(noPersist ? ":memory:" : dbPath);
+  // Keep server running
+  await new Promise(() => {});
 }
 
 // Start client
