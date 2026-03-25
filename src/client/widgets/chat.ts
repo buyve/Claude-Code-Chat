@@ -48,6 +48,111 @@ export function computeNickWidth(messages: Message[]): number {
   return Math.min(max, 16); // cap at 16
 }
 
+// Code block keywords for basic syntax coloring
+const CODE_KEYWORDS = new Set([
+  "const", "let", "var", "function", "return", "if", "else", "for", "while",
+  "import", "export", "from", "class", "new", "this", "async", "await",
+  "true", "false", "null", "undefined", "type", "interface", "enum",
+  "fn", "pub", "mut", "impl", "struct", "use", "mod", "self",
+  "def", "print", "None", "True", "False", "lambda",
+]);
+
+const CODE_BG = chalk.bgGray;
+const CODE_BORDER = chalk.dim;
+const INLINE_CODE = chalk.bgGray.white;
+
+/** Colorize a code line with basic keyword/string/comment highlighting. */
+function colorizeCode(line: string): string {
+  // Comments
+  if (line.trimStart().startsWith("//") || line.trimStart().startsWith("#")) {
+    return chalk.gray(line);
+  }
+
+  let result = "";
+  let i = 0;
+  while (i < line.length) {
+    // String literals
+    if (line[i] === '"' || line[i] === "'" || line[i] === '`') {
+      const quote = line[i]!;
+      let end = line.indexOf(quote, i + 1);
+      if (end === -1) end = line.length - 1;
+      result += chalk.green(line.slice(i, end + 1));
+      i = end + 1;
+      continue;
+    }
+
+    // Word boundary — check for keywords
+    if (/[a-zA-Z_]/.test(line[i]!)) {
+      const match = line.slice(i).match(/^[a-zA-Z_]\w*/);
+      if (match) {
+        const word = match[0];
+        if (CODE_KEYWORDS.has(word)) {
+          result += chalk.cyan(word);
+        } else {
+          result += word;
+        }
+        i += word.length;
+        continue;
+      }
+    }
+
+    result += line[i];
+    i++;
+  }
+  return result;
+}
+
+/** Format content, detecting fenced code blocks and inline code. */
+function formatContentWithCodeBlocks(content: string): string[] {
+  // Single-line content without code markers — return as-is
+  if (!content.includes("`")) {
+    return [content];
+  }
+
+  // Handle inline code (single backticks, no newlines)
+  if (!content.includes("\n") && !content.includes("```")) {
+    const formatted = content.replace(/`([^`]+)`/g, (_, code) => INLINE_CODE(` ${code} `));
+    return [formatted];
+  }
+
+  // Multi-line: split and process fenced blocks
+  const lines = content.split("\n");
+  const result: string[] = [];
+  let inCodeBlock = false;
+
+  for (const line of lines) {
+    if (line.trimStart().startsWith("```")) {
+      if (inCodeBlock) {
+        // End of code block
+        result.push(CODE_BORDER("└─────────────────────────────────┘"));
+        inCodeBlock = false;
+      } else {
+        // Start of code block
+        const lang = line.trim().slice(3).trim();
+        const header = lang ? ` ${lang} ` : "";
+        result.push(CODE_BORDER(`┌─${header}${"─".repeat(Math.max(0, 33 - header.length))}┐`));
+        inCodeBlock = true;
+      }
+      continue;
+    }
+
+    if (inCodeBlock) {
+      result.push(CODE_BORDER("│ ") + CODE_BG(colorizeCode(line)));
+    } else {
+      // Handle inline code in non-block lines
+      const formatted = line.replace(/`([^`]+)`/g, (_, code) => INLINE_CODE(` ${code} `));
+      result.push(formatted);
+    }
+  }
+
+  // Unclosed code block
+  if (inCodeBlock) {
+    result.push(CODE_BORDER("└─────────────────────────────────┘"));
+  }
+
+  return result;
+}
+
 function formatMessage(
   msg: Message,
   prevMsg: Message | null,
@@ -101,7 +206,18 @@ function formatMessage(
     const coloredNick = colorFn(nickDisplay);
     const paddedNick = padLeft(coloredNick, nickDisplay, nickW + 2); // +2 for < >
     const sep = SEPARATOR;
-    lines.push({ text: `${timeStr} ${paddedNick} ${sep} ${content}` });
+
+    // Multi-line content (code blocks)
+    const contentLines = formatContentWithCodeBlocks(content);
+    const blankTime = "     ";
+    const blankNick = " ".repeat(nickW + 2);
+    for (let i = 0; i < contentLines.length; i++) {
+      if (i === 0) {
+        lines.push({ text: `${timeStr} ${paddedNick} ${sep} ${contentLines[i]}` });
+      } else {
+        lines.push({ text: `${blankTime} ${blankNick} ${sep} ${contentLines[i]}` });
+      }
+    }
   }
 
   return lines;
