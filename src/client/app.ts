@@ -172,11 +172,16 @@ export function startApp() {
     activeIndex: 0,
     selfNick,
     users: createDummyUsers(),
-    mouseEnabled: true,
+    mouseEnabled: false,
     quitting: false,
     inputState: { text: "", cursor: 0, prompt: "[#general] " },
     completionCtx: null,
   };
+
+  if (!process.stdin.isTTY) {
+    console.error("ccc requires an interactive terminal (TTY). Run it directly, not piped.");
+    process.exit(1);
+  }
 
   if (isTooSmall()) {
     console.error("Terminal too small. Minimum 80x24 required.");
@@ -184,7 +189,7 @@ export function startApp() {
   }
 
   enterScreen();
-  enableMouse();
+  // Mouse OFF by default (like WeeChat) — Alt+M to toggle
   process.stdin.setRawMode(true);
   process.stdin.resume();
 
@@ -193,7 +198,7 @@ export function startApp() {
 
   // Cleanup on exit
   function cleanup() {
-    disableMouse();
+    if (state.mouseEnabled) disableMouse();
     process.stdin.setRawMode(false);
     exitScreen();
   }
