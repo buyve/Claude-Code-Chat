@@ -31,6 +31,11 @@ if (args[0] === "server") {
   await new Promise(() => {});
 }
 
-// Start client
+// Start client — check for first-run onboarding
+import { hasConfig, runOnboarding } from "../src/client/onboarding.ts";
 import { startApp } from "../src/client/app.ts";
+
+if (!hasConfig()) {
+  await runOnboarding();
+}
 startApp();
