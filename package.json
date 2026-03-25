@@ -1,0 +1,43 @@
+{
+  "name": "cc-chat",
+  "version": "0.1.0",
+  "description": "WeeChat-style terminal messenger for Claude Code users",
+  "type": "module",
+  "bin": {
+    "ccc": "./bin/ccc.ts"
+  },
+  "scripts": {
+    "start": "bun run bin/ccc.ts",
+    "server": "bun run src/server/index.ts",
+    "test": "bun test"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "package.json",
+    "tsconfig.json"
+  ],
+  "keywords": [
+    "claude-code",
+    "chat",
+    "tui",
+    "terminal",
+    "messenger",
+    "weechat"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/ws": "^8.18.1"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "ansi-escapes": "^7.3.0",
+    "chalk": "^5.6.2",
+    "cli-cursor": "^5.0.0",
+    "string-width": "^8.2.0",
+    "ws": "^8.20.0"
+  }
+}
