@@ -9,11 +9,56 @@ const DEFAULT_URL = "ws://localhost:3337";
 const RECONNECT_BASE = 1000;
 const RECONNECT_MAX = 16000;
 
+// Strip ANSI escape sequences from server-provided user content (prevent terminal injection)
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /[\x1b\x9b][\[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nq-uy=><~]/g;
+function stripAnsi(s: string): string {
+  return s.replace(ANSI_RE, "");
+}
+
+/** Sanitize user-generated fields in server messages to prevent terminal injection. */
+function sanitizeServerMessage(msg: ServerMessage): ServerMessage {
+  switch (msg.type) {
+    case "chat":
+      msg.message.content = stripAnsi(msg.message.content);
+      msg.message.fromNick = stripAnsi(msg.message.fromNick);
+      return msg;
+    case "history":
+      for (const m of msg.messages) {
+        m.content = stripAnsi(m.content);
+        m.fromNick = stripAnsi(m.fromNick);
+      }
+      return msg;
+    case "join":
+      msg.user.nick = stripAnsi(msg.user.nick);
+      return msg;
+    case "part":
+      msg.nick = stripAnsi(msg.nick);
+      if (msg.message) msg.message = stripAnsi(msg.message);
+      return msg;
+    case "nick_change":
+      msg.oldNick = stripAnsi(msg.oldNick);
+      msg.newNick = stripAnsi(msg.newNick);
+      return msg;
+    case "members":
+      for (const u of msg.members) {
+        u.nick = stripAnsi(u.nick);
+      }
+      return msg;
+    case "error":
+      msg.message = stripAnsi(msg.message);
+      return msg;
+    default:
+      return msg;
+  }
+}
+
 export type ConnectionStatus = "connecting" | "connected" | "disconnected";
 
 export interface ConnectionHandler {
   onMessage: (msg: ServerMessage) => void;
   onStatusChange: (status: ConnectionStatus, detail?: string) => void;
+  onLagUpdate?: (lagMs: number) => void;
 }
 
 export interface Connection {
@@ -36,6 +81,8 @@ export function createConnection(handler: ConnectionHandler): Connection {
   let status: ConnectionStatus = "disconnected";
   let reconnectDelay = RECONNECT_BASE;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let pingTimer: ReturnType<typeof setInterval> | null = null;
+  let pingStart = 0;
   let closed = false;
 
   function setStatus(s: ConnectionStatus, detail?: string) {
@@ -51,6 +98,20 @@ export function createConnection(handler: ConnectionHandler): Connection {
 
     ws.on("open", () => {
       reconnectDelay = RECONNECT_BASE; // reset on successful connect
+      // Start periodic ping for lag measurement
+      pingTimer = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          pingStart = Date.now();
+          ws.ping();
+        }
+      }, 15_000);
+    });
+
+    ws.on("pong", () => {
+      if (pingStart > 0) {
+        handler.onLagUpdate?.(Date.now() - pingStart);
+        pingStart = 0;
+      }
     });
 
     ws.on("message", (data: WebSocket.Data) => {
@@ -76,13 +137,14 @@ export function createConnection(handler: ConnectionHandler): Connection {
           setStatus("connected");
         }
 
-        handler.onMessage(serverMsg);
+        handler.onMessage(sanitizeServerMessage(serverMsg));
       } catch {
         // Malformed message — ignore silently
       }
     });
 
     ws.on("close", () => {
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
       ws = null;
       if (!closed) {
         setStatus("disconnected", `retrying ${Math.round(reconnectDelay / 1000)}s...`);
@@ -119,6 +181,10 @@ export function createConnection(handler: ConnectionHandler): Connection {
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
+      }
+      if (pingTimer) {
+        clearInterval(pingTimer);
+        pingTimer = null;
       }
       if (ws) {
         ws.close();

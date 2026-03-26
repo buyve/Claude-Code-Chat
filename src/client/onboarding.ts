@@ -91,7 +91,7 @@ export async function runOnboarding(): Promise<CccConfig> {
   return config;
 }
 
-/** Read a line from stdin (non-raw mode). */
+/** Read a line from stdin (non-raw mode). Handles Ctrl+C gracefully. */
 function readLine(): Promise<string> {
   return new Promise((resolve) => {
     // Temporarily exit raw mode for line reading
@@ -99,7 +99,15 @@ function readLine(): Promise<string> {
     if (wasRaw) process.stdin.setRawMode(false);
 
     process.stdin.resume();
+
+    const sigintHandler = () => {
+      process.stdout.write("\n  Aborted.\n");
+      process.exit(0);
+    };
+    process.on("SIGINT", sigintHandler);
+
     process.stdin.once("data", (data: Buffer) => {
+      process.removeListener("SIGINT", sigintHandler);
       const line = data.toString("utf-8").trim();
       if (wasRaw) process.stdin.setRawMode(true);
       resolve(line);

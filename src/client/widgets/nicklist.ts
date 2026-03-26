@@ -48,6 +48,7 @@ export interface NicklistState {
 interface NicklistLine {
   type: "header" | "nick";
   text: string;
+  user?: User;
 }
 
 function buildLines(users: User[]): NicklistLine[] {
@@ -75,11 +76,23 @@ function buildLines(users: User[]): NicklistLine[] {
         u.presence === "offline"
           ? INACTIVE_DIM(u.nick)
           : nickColor(u.nick)(u.nick);
-      lines.push({ type: "nick", text: ` ${icon} ${coloredNick}` });
+      lines.push({ type: "nick", text: ` ${icon} ${coloredNick}`, user: u });
     }
   }
 
   return lines;
+}
+
+/** Resolve which user was clicked given a row offset within the nicklist. */
+export function resolveNicklistClick(
+  users: User[],
+  clickedRow: number,
+  scrollOffset: number,
+): User | null {
+  const lines = buildLines(users);
+  const idx = scrollOffset + clickedRow;
+  if (idx < 0 || idx >= lines.length) return null;
+  return lines[idx]!.user ?? null;
 }
 
 export function renderNicklist(region: Region, state: NicklistState) {

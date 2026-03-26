@@ -17,6 +17,13 @@ import { decodeMessage, encodeMessage } from "../shared/protocol.ts";
 import type { ClientMessage } from "../shared/protocol.ts";
 import type { Message, User } from "../shared/types.ts";
 
+// Strip ANSI escape sequences from user-generated content (prevent terminal injection)
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /[\x1b\x9b][\[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nq-uy=><~]/g;
+function stripAnsi(s: string): string {
+  return s.replace(ANSI_RE, "");
+}
+
 const PORT = parseInt(process.env["CCC_PORT"] ?? "3337", 10);
 const HOST = process.env["CCC_HOST"] ?? "0.0.0.0";
 
@@ -56,6 +63,7 @@ interface ServerState {
   presence: PresenceManager;
   lastPong: Map<string, number>;
   rateBuckets: Map<string, RateBucket>;
+  userRegistry: Map<string, User>; // shared User per userId (multi-socket consistency)
 }
 
 function createServerState(dbPath?: string): ServerState {
@@ -67,6 +75,7 @@ function createServerState(dbPath?: string): ServerState {
     presence: createPresenceManager(),
     lastPong: new Map(),
     rateBuckets: new Map(),
+    userRegistry: new Map(),
   };
 }
 
@@ -121,30 +130,34 @@ export function startServer(dbPath?: string) {
         const user = removeConnection(ws, state.auth);
         state.lastPong.delete(ws.data.id);
         if (user) {
-          // Start grace period before marking offline
+          // If user still has other active sockets, no action needed
+          if (findSockets(user.id, state.auth).length > 0) return;
+
+          // Last socket closed — preserve channel membership, start grace period
+          // Channels are kept intact so reconnect within 30s restores everything
           state.presence.disconnect(user.id, (userId) => {
+            // Grace period expired — user didn't reconnect in time
+            const currentUser = state.userRegistry.get(userId);
+            const nick = currentUser?.nick ?? user.nick;
             const userChannels = state.channels.getUserChannels(userId);
+
+            // Broadcast part to all channels before removing membership
             for (const ch of userChannels) {
               broadcast(state, ch, encodeMessage({
-                type: "presence_update",
+                type: "part",
+                channel: ch,
                 userId,
-                status: "offline",
+                nick,
+                message: "Connection lost",
               }));
             }
+            // Remove from channels after broadcast (so members list is intact)
+            for (const ch of userChannels) {
+              if (currentUser) state.channels.part(currentUser, ch);
+            }
+            // Clean up user registry
+            state.userRegistry.delete(userId);
           });
-
-          const userChannels = state.channels.getUserChannels(user.id);
-          for (const ch of userChannels) {
-            // Broadcast before part so members still includes the user's channel
-            broadcast(state, ch, encodeMessage({
-              type: "part",
-              channel: ch,
-              userId: user.id,
-              nick: user.nick,
-              message: "Connection lost",
-            }));
-            state.channels.part(user, ch);
-          }
         }
       },
 
@@ -179,7 +192,7 @@ function handleMessage(
 ) {
   // Auth message (before authenticated)
   if (msg.type === "auth") {
-    const user = handleAuth(
+    let user = handleAuth(
       ws,
       msg.publicKey,
       msg.signature,
@@ -187,33 +200,54 @@ function handleMessage(
       (fp) => state.store.getNick(fp) ?? `user_${fp.slice(0, 8)}`,
     );
     if (user) {
-      // Persist nick
-      state.store.setNick(user.id, user.nick);
+      // Ensure shared User object per userId (multi-socket consistency)
+      const existing = state.userRegistry.get(user.id);
+      if (existing) {
+        // Reuse existing — all sockets share one User object
+        state.auth.authenticated.set(ws, existing);
+        user = existing;
+      } else {
+        state.userRegistry.set(user.id, user);
+      }
 
-      // Init/restore presence
+      state.store.setNick(user.id, user.nick);
       state.presence.reconnect(user.id);
       state.presence.update(user.id, "online");
+      user.presence = "online";
 
       ws.send(encodeMessage({ type: "auth_ok", user }));
 
-      // Auto-join #general
-      state.channels.join(user, "#general");
-
-      // Send channel members
-      const members = state.channels.getMembers("#general");
-      const memberUsers = getMemberUsers(members, state);
-      ws.send(encodeMessage({ type: "members", channel: "#general", members: memberUsers }));
-
-      // Send history
-      const history = state.store.getHistory("#general");
-      ws.send(encodeMessage({ type: "history", channel: "#general", messages: history }));
-
-      // Broadcast join to others
-      broadcast(state, "#general", encodeMessage({
-        type: "join",
-        channel: "#general",
-        user,
-      }), user.id);
+      // Check if user already has channels (reconnect within grace period)
+      const existingChannels = state.channels.getUserChannels(user.id);
+      if (existingChannels.length > 0) {
+        // Restore all channels — send history + members for each
+        for (const ch of existingChannels) {
+          const chMembers = state.channels.getMembers(ch);
+          const chMemberUsers = getMemberUsers(chMembers, state);
+          ws.send(encodeMessage({ type: "members", channel: ch, members: chMemberUsers }));
+          const chHistory = state.store.getHistory(ch);
+          ws.send(encodeMessage({ type: "history", channel: ch, messages: chHistory }));
+        }
+        // Notify others that user is back online
+        for (const ch of existingChannels) {
+          broadcast(state, ch, encodeMessage({
+            type: "presence_update",
+            userId: user.id,
+            status: "online",
+          }), user.id);
+        }
+      } else {
+        // First connect or after grace period expired — auto-join #general
+        state.channels.join(user, "#general");
+        const members = state.channels.getMembers("#general");
+        const memberUsers = getMemberUsers(members, state);
+        ws.send(encodeMessage({ type: "members", channel: "#general", members: memberUsers }));
+        const history = state.store.getHistory("#general");
+        ws.send(encodeMessage({ type: "history", channel: "#general", messages: history }));
+        broadcast(state, "#general", encodeMessage({
+          type: "join", channel: "#general", user,
+        }), user.id);
+      }
     }
     return;
   }
@@ -227,7 +261,7 @@ function handleMessage(
 
   // Rate limit chat/action messages
   if ((msg.type === "chat" || msg.type === "action") && !checkRateLimit(state.rateBuckets, user.id)) {
-    ws.send(encodeMessage({ type: "error", code: "RATE_LIMITED", message: "Slow down — too many messages" }));
+    ws.send(encodeMessage({ type: "error", code: "RATE_LIMITED", message: `Slow down — retry in ~${Math.ceil(RATE_LIMIT_REFILL_MS / 1000)}s` }));
     return;
   }
 
@@ -237,12 +271,17 @@ function handleMessage(
         ws.send(encodeMessage({ type: "error", code: "MSG_TOO_LONG", message: "Message exceeds 4096 characters" }));
         break;
       }
+      // Verify sender is a member of the target channel
+      if (!state.channels.getMembers(msg.channel).includes(user.id)) {
+        ws.send(encodeMessage({ type: "error", code: "NOT_IN_CHANNEL", message: "You are not in that channel" }));
+        break;
+      }
       const chatMsg: Message = {
         id: crypto.randomUUID(),
         from: user.id,
         fromNick: user.nick,
         channel: msg.channel,
-        content: msg.content,
+        content: stripAnsi(msg.content),
         timestamp: Date.now(),
         type: "chat",
       };
@@ -256,12 +295,17 @@ function handleMessage(
         ws.send(encodeMessage({ type: "error", code: "MSG_TOO_LONG", message: "Action exceeds 4096 characters" }));
         break;
       }
+      // Verify sender is a member of the target channel
+      if (!state.channels.getMembers(msg.channel).includes(user.id)) {
+        ws.send(encodeMessage({ type: "error", code: "NOT_IN_CHANNEL", message: "You are not in that channel" }));
+        break;
+      }
       const actionMsg: Message = {
         id: crypto.randomUUID(),
         from: user.id,
         fromNick: user.nick,
         channel: msg.channel,
-        content: msg.content,
+        content: stripAnsi(msg.content),
         timestamp: Date.now(),
         type: "action",
       };
@@ -271,8 +315,10 @@ function handleMessage(
     }
 
     case "join": {
-      if (!msg.channel.startsWith("#") || msg.channel.length > 50) {
-        ws.send(encodeMessage({ type: "error", code: "INVALID_CHANNEL", message: "Channel must start with # and be under 50 chars" }));
+      // Channel: # + 1-49 non-whitespace, non-control chars
+      // eslint-disable-next-line no-control-regex
+      if (!/^#[^\s\x00-\x1f\x7f]{1,49}$/.test(msg.channel)) {
+        ws.send(encodeMessage({ type: "error", code: "INVALID_CHANNEL", message: "Channel must be #name (1-49 non-whitespace chars)" }));
         break;
       }
       if (!state.channels.join(user, msg.channel)) {
@@ -313,6 +359,11 @@ function handleMessage(
         break;
       }
 
+      // Warn sender if recipient is in DND mode
+      if (state.presence.isDnd(msg.to)) {
+        ws.send(encodeMessage({ type: "error", code: "USER_DND", message: "User is in Do Not Disturb mode — message delivered silently" }));
+      }
+
       const dmChannel = dmChannelName(user.id, msg.to);
       // Track DM channel membership so history is accessible
       state.channels.join(user, dmChannel);
@@ -325,7 +376,7 @@ function handleMessage(
         from: user.id,
         fromNick: user.nick,
         channel: dmChannel,
-        content: msg.content,
+        content: stripAnsi(msg.content),
         timestamp: Date.now(),
         type: "chat",
       };
@@ -341,7 +392,7 @@ function handleMessage(
 
     case "nick": {
       const oldNick = user.nick;
-      const newNick = msg.nick.trim();
+      const newNick = stripAnsi(msg.nick.trim());
 
       // eslint-disable-next-line no-control-regex
       if (!newNick || newNick.length > 20 || /[\x00-\x1f\x7f]/.test(newNick)) {

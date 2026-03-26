@@ -2,7 +2,7 @@
 
 import { Database } from "bun:sqlite";
 import type { Message } from "../shared/types.ts";
-import { mkdirSync, existsSync } from "fs";
+import { mkdirSync, existsSync, chmodSync } from "fs";
 import { dirname } from "path";
 
 const MAX_MESSAGES_PER_CHANNEL = 10_000;
@@ -14,6 +14,9 @@ export interface Store {
   getNick(userId: string): string | null;
   setNick(userId: string, nick: string): void;
   nickExists(nick: string, excludeUserId?: string): boolean;
+  saveChannelMember(channel: string, userId: string): void;
+  removeChannelMember(channel: string, userId: string): void;
+  getAllChannelMembers(): Map<string, Set<string>>;
   close(): void;
 }
 
@@ -29,6 +32,18 @@ export function createStore(dbPath?: string): Store {
   }
 
   const db = new Database(finalPath ?? ":memory:");
+
+  // Restrict file permissions to owner-only (prevent local privilege escalation)
+  if (!isMemory && finalPath) {
+    try {
+      chmodSync(finalPath, 0o600);
+      // Also restrict WAL and SHM files if they exist
+      if (existsSync(finalPath + "-wal")) chmodSync(finalPath + "-wal", 0o600);
+      if (existsSync(finalPath + "-shm")) chmodSync(finalPath + "-shm", 0o600);
+    } catch {
+      // Non-fatal — may fail on some filesystems
+    }
+  }
 
   // WAL mode for concurrent reads
   db.run("PRAGMA journal_mode=WAL");
@@ -106,6 +121,19 @@ export function createStore(dbPath?: string): Store {
     SELECT public_key FROM users WHERE nick = ? AND public_key != ?
   `);
 
+  const insertMember = db.prepare(`
+    INSERT OR IGNORE INTO channel_members (channel, user_id, joined_at)
+    VALUES (?, ?, ?)
+  `);
+
+  const deleteMember = db.prepare(`
+    DELETE FROM channel_members WHERE channel = ? AND user_id = ?
+  `);
+
+  const selectAllMembers = db.prepare(`
+    SELECT channel, user_id FROM channel_members
+  `);
+
   return {
     addMessage(msg: Message) {
       insertMsg.run(msg.id, msg.channel, msg.from, msg.fromNick, msg.content, msg.type, msg.timestamp);
@@ -152,6 +180,24 @@ export function createStore(dbPath?: string): Store {
     nickExists(nick: string, excludeUserId = ""): boolean {
       const row = checkNickExists.get(nick, excludeUserId);
       return row != null;
+    },
+
+    saveChannelMember(channel: string, userId: string) {
+      insertMember.run(channel, userId, Date.now());
+    },
+
+    removeChannelMember(channel: string, userId: string) {
+      deleteMember.run(channel, userId);
+    },
+
+    getAllChannelMembers(): Map<string, Set<string>> {
+      const rows = selectAllMembers.all() as Array<{ channel: string; user_id: string }>;
+      const result = new Map<string, Set<string>>();
+      for (const row of rows) {
+        if (!result.has(row.channel)) result.set(row.channel, new Set());
+        result.get(row.channel)!.add(row.user_id);
+      }
+      return result;
     },
 
     close() {

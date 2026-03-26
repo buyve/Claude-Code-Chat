@@ -38,18 +38,6 @@ interface ChatLine {
   isReadMarker?: boolean;
 }
 
-// Compute the nick alignment width (max nick length in current messages)
-export function computeNickWidth(messages: Message[]): number {
-  let max = 4; // minimum width
-  for (const m of messages) {
-    if (m.type === "chat" || m.type === "action") {
-      const w = stringWidth(m.fromNick);
-      if (w > max) max = w;
-    }
-  }
-  return Math.min(max, 16); // cap at 16
-}
-
 // Code block keywords for basic syntax coloring
 const CODE_KEYWORDS = new Set([
   "const", "let", "var", "function", "return", "if", "else", "for", "while",
@@ -62,6 +50,7 @@ const CODE_KEYWORDS = new Set([
 const CODE_BG = chalk.bgGray;
 const CODE_BORDER = chalk.dim;
 const INLINE_CODE = chalk.bgGray.white;
+const CODE_BLOCK_WIDTH = 50; // inner width of code block borders
 
 /** Colorize a code line with basic keyword/string/comment highlighting. */
 function colorizeCode(line: string): string {
@@ -126,13 +115,14 @@ function formatContentWithCodeBlocks(content: string): string[] {
     if (line.trimStart().startsWith("```")) {
       if (inCodeBlock) {
         // End of code block
-        result.push(CODE_BORDER("└─────────────────────────────────┘"));
+        result.push(CODE_BORDER("└" + "─".repeat(CODE_BLOCK_WIDTH) + "┘"));
         inCodeBlock = false;
       } else {
         // Start of code block
         const lang = line.trim().slice(3).trim();
         const header = lang ? ` ${lang} ` : "";
-        result.push(CODE_BORDER(`┌─${header}${"─".repeat(Math.max(0, 33 - header.length))}┐`));
+        const fill = Math.max(0, CODE_BLOCK_WIDTH - 1 - header.length);
+        result.push(CODE_BORDER(`┌─${header}${"─".repeat(fill)}┐`));
         inCodeBlock = true;
       }
       continue;
@@ -149,7 +139,7 @@ function formatContentWithCodeBlocks(content: string): string[] {
 
   // Unclosed code block
   if (inCodeBlock) {
-    result.push(CODE_BORDER("└─────────────────────────────────┘"));
+    result.push(CODE_BORDER("└" + "─".repeat(CODE_BLOCK_WIDTH) + "┘"));
   }
 
   return result;

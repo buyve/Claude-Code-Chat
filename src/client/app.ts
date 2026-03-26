@@ -18,7 +18,7 @@ import {
 } from "./widgets/buflist.ts";
 import { renderChat, isAtBottom, renderCCSessionPlaceholder } from "./widgets/chat.ts";
 import stringWidth from "string-width";
-import { renderNicklist, renderCCSessionMeta } from "./widgets/nicklist.ts";
+import { renderNicklist, renderCCSessionMeta, resolveNicklistClick } from "./widgets/nicklist.ts";
 import {
   renderInput,
   createHistory,
@@ -99,6 +99,7 @@ interface AppState {
   altJPending: boolean; // waiting for 2-digit buffer number after Alt+J
   altJFirstDigit: string; // first digit captured
   bareMode: boolean; // Alt+L: strip colors for bare display
+  lag?: number; // WebSocket round-trip latency in ms
 }
 
 function createInitialBuffers(): BufferState[] {
@@ -206,6 +207,17 @@ function getOrCreateBuffer(state: AppState, channel: string, topic = ""): number
   return findBufferByChannel(state, channel);
 }
 
+/** Resolve display name for a buffer (DM channels → peer nick). */
+function displayName(buf: BufferState, state: AppState): string {
+  if (buf.bufferType === "dm" && buf.channel.name.startsWith("dm:")) {
+    const parts = buf.channel.name.split(":");
+    const peerId = parts[1] === state.selfId ? parts[2] : parts[1];
+    const peer = state.users.find((u) => u.id === peerId);
+    return peer ? peer.nick : (peerId?.slice(0, 8) ?? "DM");
+  }
+  return buf.channel.name;
+}
+
 /** Push a message and update the cached nick width. */
 function pushMessage(buf: BufferState, msg: Message) {
   buf.messages.push(msg);
@@ -217,9 +229,9 @@ function pushMessage(buf: BufferState, msg: Message) {
   }
 }
 
-function buildBuflistEntries(buffers: BufferState[]): BuflistEntry[] {
-  return buffers.map((buf, i) => ({
-    name: buf.channel.name,
+function buildBuflistEntries(state: AppState): BuflistEntry[] {
+  return state.buffers.map((buf, i) => ({
+    name: displayName(buf, state),
     bufferType: buf.bufferType,
     channel: buf.channel,
     globalIndex: i,
@@ -237,7 +249,13 @@ function handleServerMessage(
     case "auth_ok": {
       state.selfNick = msg.user.nick;
       state.selfId = msg.user.id;
-      state.inputState.prompt = `[${state.buffers[state.activeIndex]!.channel.name}] `;
+      state.inputState.prompt = `[${displayName(state.buffers[state.activeIndex]!, state)}] `;
+
+      // If user configured a nick (via onboarding/env) that differs, request change
+      const desiredNick = process.env["CCC_NICK"];
+      if (desiredNick && desiredNick !== msg.user.nick && state.connection) {
+        state.connection.send({ type: "nick", nick: desiredNick });
+      }
       break;
     }
 
@@ -350,9 +368,12 @@ function handleServerMessage(
     case "history": {
       const idx = getOrCreateBuffer(state, msg.channel);
       const histBuf = state.buffers[idx]!;
-      histBuf.messages = [...msg.messages, ...histBuf.messages];
+      // Dedup by message ID to prevent duplicates on reconnect
+      const existingIds = new Set(histBuf.messages.map((m) => m.id));
+      const newMessages = msg.messages.filter((m) => !existingIds.has(m.id));
+      histBuf.messages = [...newMessages, ...histBuf.messages];
       // Recompute nick width from history
-      for (const m of msg.messages) {
+      for (const m of newMessages) {
         if (m.type === "chat" || m.type === "action") {
           const w = stringWidth(m.fromNick);
           if (w > histBuf.cachedNickWidth && w <= 16) histBuf.cachedNickWidth = w;
@@ -423,7 +444,7 @@ function renderAll(layout: Layout, state: AppState) {
   const isCC = buf.bufferType === "cc_session";
 
   renderTitlebar(layout.titlebar, {
-    channel: buf.channel.name,
+    channel: displayName(buf, state),
     topic: buf.channel.topic,
   });
 
@@ -437,10 +458,11 @@ function renderAll(layout: Layout, state: AppState) {
   renderStatusbar(layout.statusbar, {
     nick: state.selfNick,
     status: isCC ? "CC Session" : statusText,
-    channel: buf.channel.name,
+    channel: displayName(buf, state),
+    lag: state.lag,
   });
 
-  const entries = buildBuflistEntries(state.buffers);
+  const entries = buildBuflistEntries(state);
   const buflistScroll = adjustBuflistScroll(
     entries, state.activeIndex, 0, layout.buflist.h,
   );
@@ -535,6 +557,10 @@ export function startApp() {
       }
       renderAll(layout, state);
     },
+    onLagUpdate(lagMs: number) {
+      state.lag = lagMs;
+      renderAll(layout, state);
+    },
   });
   state.connection = conn;
 
@@ -604,7 +630,7 @@ function switchBuffer(state: AppState, index: number) {
   }
   state.activeIndex = index;
   state.buffers[index]!.channel.hotlist = emptyHotlist();
-  state.inputState.prompt = `[${state.buffers[index]!.channel.name}] `;
+  state.inputState.prompt = `[${displayName(state.buffers[index]!, state)}] `;
   state.completionCtx = null;
 }
 
@@ -624,7 +650,7 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
         const bufNum = parseInt(state.altJFirstDigit + action.ch, 10);
         state.altJPending = false;
         state.altJFirstDigit = "";
-        state.inputState.prompt = `[${buf.channel.name}] `;
+        state.inputState.prompt = `[${displayName(buf, state)}] `;
         switchBuffer(state, bufNum - 1);
         return;
       }
@@ -632,7 +658,7 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
     // Any non-digit cancels
     state.altJPending = false;
     state.altJFirstDigit = "";
-    state.inputState.prompt = `[${buf.channel.name}] `;
+    state.inputState.prompt = `[${displayName(buf, state)}] `;
   }
 
   // Quit confirmation mode
@@ -667,12 +693,12 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
     } else if (action.type === "enter" || action.type === "ctrl_r") {
       // Accept or cycle
       state.historySearchMode = false;
-      state.inputState.prompt = `[${buf.channel.name}] `;
+      state.inputState.prompt = `[${displayName(buf, state)}] `;
       return;
     } else {
       // Any other key exits search
       state.historySearchMode = false;
-      state.inputState.prompt = `[${buf.channel.name}] `;
+      state.inputState.prompt = `[${displayName(buf, state)}] `;
     }
   }
 
@@ -744,7 +770,7 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
       };
       const region = identifyRegion(action.col, action.row, bounds);
       if (region === "buflist") {
-        const entries = buildBuflistEntries(state.buffers);
+        const entries = buildBuflistEntries(state);
         const buflistScroll = adjustBuflistScroll(
           entries, state.activeIndex, 0, layout.buflist.h,
         );
@@ -754,21 +780,19 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
       } else if (region === "nicklist") {
         // Show rich presence of clicked user in statusbar
         const clickedRow = action.row - layout.nicklist.y;
-        if (clickedRow >= 0 && clickedRow < state.users.length) {
-          const clickedUser = state.users[clickedRow];
-          if (clickedUser) {
-            const rich = clickedUser.richPresence;
-            const info = rich
-              ? `${clickedUser.nick} — ${rich.project}${rich.language ? ` · ${rich.language}` : ""}${rich.duration ? ` · ${rich.duration}m` : ""}`
-              : `${clickedUser.nick} — ${clickedUser.presence}`;
-            renderStatusbar(layout.statusbar, {
-              nick: state.selfNick,
-              status: info,
-              channel: buf.channel.name,
-            });
-            layout.render();
-            renderInput(layout.input, state.inputState);
-          }
+        const clickedUser = resolveNicklistClick(state.users, clickedRow, 0);
+        if (clickedRow >= 0 && clickedUser) {
+          const rich = clickedUser.richPresence;
+          const info = rich
+            ? `${clickedUser.nick} — ${rich.project}${rich.language ? ` · ${rich.language}` : ""}${rich.duration ? ` · ${rich.duration}m` : ""}`
+            : `${clickedUser.nick} — ${clickedUser.presence}`;
+          renderStatusbar(layout.statusbar, {
+            nick: state.selfNick,
+            status: info,
+            channel: displayName(buf, state),
+          });
+          layout.render();
+          renderInput(layout.input, state.inputState);
         }
       }
       break;
@@ -921,7 +945,7 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
       }
 
       state.inputState = clearInput(state.inputState);
-      state.inputState.prompt = `[${buf.channel.name}] `;
+      state.inputState.prompt = `[${displayName(buf, state)}] `;
       break;
     }
 
