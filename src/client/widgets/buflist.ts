@@ -36,6 +36,7 @@ function formatHotlist(ch: Channel): string {
   const h = ch.hotlist;
   const parts: string[] = [];
   if (h.highlight > 0) parts.push(hotlistStyle(3)(String(h.highlight)));
+  if (h.private > 0) parts.push(hotlistStyle(2)(String(h.private)));
   if (h.message > 0) parts.push(hotlistStyle(1)(String(h.message)));
   if (h.low > 0) parts.push(hotlistStyle(0)(String(h.low)));
   return parts.length > 0 ? ` (${parts.join(",")})` : "";
@@ -94,11 +95,18 @@ export function renderBuflist(region: Region, state: BuflistState) {
     region.writeLine(row, lines[idx]!.text);
   }
 
+  // Scroll indicators at right edge to preserve content
   if (hasUp) {
-    region.writeLine(0, ` ${SCROLL_INDICATOR("▲ more")}`);
+    const tag = SCROLL_INDICATOR("▲");
+    const col = region.x + region.w - 2;
+    process.stdout.write(`\x1b[${region.y + 1};${col + 1}H` + tag);
   }
   if (hasDown) {
-    region.writeLine(visibleRows - 1, ` ${SCROLL_INDICATOR("▼ more")}`);
+    const tag = SCROLL_INDICATOR("▼");
+    const col = region.x + region.w - 2;
+    process.stdout.write(
+      `\x1b[${region.y + visibleRows};${col + 1}H` + tag,
+    );
   }
 }
 

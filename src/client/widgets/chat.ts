@@ -35,6 +35,7 @@ export interface ChatState {
 interface ChatLine {
   text: string;
   centered?: boolean;
+  isReadMarker?: boolean;
 }
 
 // Compute the nick alignment width (max nick length in current messages)
@@ -203,7 +204,20 @@ function formatMessage(
       );
     }
 
-    const nickDisplay = `<${msg.fromNick}>`;
+    // Truncate long nicks to fit alignment column
+    let displayNick = msg.fromNick;
+    if (stringWidth(displayNick) > nickW) {
+      // Truncate to nickW - 1 and add ellipsis
+      let acc = 0;
+      let cutIdx = 0;
+      for (cutIdx = 0; cutIdx < displayNick.length; cutIdx++) {
+        const cw = stringWidth(displayNick[cutIdx]!);
+        if (acc + cw > nickW - 1) break;
+        acc += cw;
+      }
+      displayNick = displayNick.slice(0, cutIdx) + "…";
+    }
+    const nickDisplay = `<${displayNick}>`;
     const coloredNick = colorFn(nickDisplay);
     const paddedNick = padLeft(coloredNick, nickDisplay, nickW + 2); // +2 for < >
     const sep = SEPARATOR;
@@ -256,9 +270,9 @@ function buildAllLines(state: ChatState): ChatLine[] {
     const formatted = formatMessage(msg, prev, nickWidth, selfNick);
     lines.push(...formatted);
 
-    // Read marker after this message
+    // Read marker after this message (width placeholder, replaced at render time)
     if (i === readMarkerIndex && i < messages.length - 1) {
-      lines.push({ text: READ_MARKER_STYLE(READ_MARKER_CHAR.repeat(60)) });
+      lines.push({ text: "__READ_MARKER__", isReadMarker: true });
     }
   }
 
@@ -283,7 +297,9 @@ export function renderChat(region: Region, state: ChatState) {
     const lineIdx = topIndex + row;
     if (lineIdx >= endIndex) break;
     const line = allLines[lineIdx]!;
-    if (line.centered) {
+    if (line.isReadMarker) {
+      region.writeLine(row, READ_MARKER_STYLE(READ_MARKER_CHAR.repeat(region.w)));
+    } else if (line.centered) {
       const rawLen = stringWidth(line.text);
       const pad = Math.max(0, Math.floor((region.w - rawLen) / 2));
       region.writeLine(row, " ".repeat(pad) + line.text);
@@ -292,15 +308,23 @@ export function renderChat(region: Region, state: ChatState) {
     }
   }
 
-  // Scroll indicators
+  // Scroll indicators — render at right edge so they don't destroy content
   if (hasUp) {
-    region.writeLine(0, SCROLL_INDICATOR(` ▲ more (${topIndex} lines)`));
+    const tag = SCROLL_INDICATOR(` ▲${topIndex} `);
+    const tagW = stringWidth(` ▲${topIndex} `);
+    // Overwrite only the right portion of the first row
+    const col = region.x + region.w - tagW;
+    process.stdout.write(
+      `\x1b[${region.y + 1};${col + 1}H` + tag,
+    );
   }
   if (hasDown) {
     const remaining = totalLines - endIndex;
-    region.writeLine(
-      visibleRows - 1,
-      SCROLL_INDICATOR(` ▼ more (${remaining} lines)`),
+    const tag = SCROLL_INDICATOR(` ▼${remaining} `);
+    const tagW = stringWidth(` ▼${remaining} `);
+    const col = region.x + region.w - tagW;
+    process.stdout.write(
+      `\x1b[${region.y + visibleRows};${col + 1}H` + tag,
     );
   }
 }

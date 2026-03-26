@@ -7,13 +7,25 @@ import type { User, PresenceStatus, CCSession } from "../../shared/types.ts";
 import { nickColor, INACTIVE_DIM, SCROLL_INDICATOR } from "../theme.ts";
 
 // Presence icons — emoji with ASCII fallback
-const PRESENCE_ICONS: Record<PresenceStatus, string> = {
+const EMOJI_ICONS: Record<PresenceStatus, string> = {
   coding:    "⚡",
   online:    "●",
   reviewing: "💬",
   dnd:       "⊘",
   offline:   "○",
 };
+
+const ASCII_ICONS: Record<PresenceStatus, string> = {
+  coding:    "C",
+  online:    "O",
+  reviewing: "R",
+  dnd:       "D",
+  offline:   "X",
+};
+
+const PRESENCE_ICONS = process.env["CCC_ASCII_ICONS"]
+  ? ASCII_ICONS
+  : EMOJI_ICONS;
 
 // Group order: coding > reviewing > online > dnd > offline
 const GROUP_ORDER: PresenceStatus[] = [
@@ -85,8 +97,17 @@ export function renderNicklist(region: Region, state: NicklistState) {
     region.writeLine(row, lines[idx]!.text);
   }
 
-  if (hasUp) region.writeLine(0, ` ${SCROLL_INDICATOR("▲")}`);
-  if (hasDown) region.writeLine(visibleRows - 1, ` ${SCROLL_INDICATOR("▼")}`);
+  // Scroll indicators at right edge to preserve content
+  if (hasUp) {
+    const col = region.x + region.w - 2;
+    process.stdout.write(`\x1b[${region.y + 1};${col + 1}H` + SCROLL_INDICATOR("▲"));
+  }
+  if (hasDown) {
+    const col = region.x + region.w - 2;
+    process.stdout.write(
+      `\x1b[${region.y + visibleRows};${col + 1}H` + SCROLL_INDICATOR("▼"),
+    );
+  }
 }
 
 // Render CC session metadata in the nicklist area

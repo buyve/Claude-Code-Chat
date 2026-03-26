@@ -23,12 +23,39 @@ const HOST = process.env["CCC_HOST"] ?? "0.0.0.0";
 const HEARTBEAT_INTERVAL = 30_000;
 const HEARTBEAT_TIMEOUT = 60_000;
 
+// Simple per-user rate limiter (token bucket)
+const RATE_LIMIT_TOKENS = 10; // max burst
+const RATE_LIMIT_REFILL_MS = 1000; // refill 1 token per this interval
+interface RateBucket { tokens: number; lastRefill: number; }
+
+function checkRateLimit(buckets: Map<string, RateBucket>, userId: string): boolean {
+  const now = Date.now();
+  let bucket = buckets.get(userId);
+  if (!bucket) {
+    bucket = { tokens: RATE_LIMIT_TOKENS, lastRefill: now };
+    buckets.set(userId, bucket);
+  }
+  // Refill tokens
+  const elapsed = now - bucket.lastRefill;
+  const refill = Math.floor(elapsed / RATE_LIMIT_REFILL_MS);
+  if (refill > 0) {
+    bucket.tokens = Math.min(RATE_LIMIT_TOKENS, bucket.tokens + refill);
+    bucket.lastRefill = now;
+  }
+  if (bucket.tokens > 0) {
+    bucket.tokens--;
+    return true;
+  }
+  return false;
+}
+
 interface ServerState {
   auth: AuthState;
   store: Store;
   channels: ChannelManager;
   presence: PresenceManager;
   lastPong: Map<string, number>;
+  rateBuckets: Map<string, RateBucket>;
 }
 
 function createServerState(dbPath?: string): ServerState {
@@ -39,6 +66,7 @@ function createServerState(dbPath?: string): ServerState {
     channels: createChannelManager(store),
     presence: createPresenceManager(),
     lastPong: new Map(),
+    rateBuckets: new Map(),
   };
 }
 
@@ -197,6 +225,12 @@ function handleMessage(
     return;
   }
 
+  // Rate limit chat/action messages
+  if ((msg.type === "chat" || msg.type === "action") && !checkRateLimit(state.rateBuckets, user.id)) {
+    ws.send(encodeMessage({ type: "error", code: "RATE_LIMITED", message: "Slow down — too many messages" }));
+    return;
+  }
+
   switch (msg.type) {
     case "chat": {
       if (msg.content.length > 4096) {
@@ -218,6 +252,10 @@ function handleMessage(
     }
 
     case "action": {
+      if (msg.content.length > 4096) {
+        ws.send(encodeMessage({ type: "error", code: "MSG_TOO_LONG", message: "Action exceeds 4096 characters" }));
+        break;
+      }
       const actionMsg: Message = {
         id: crypto.randomUUID(),
         from: user.id,
@@ -237,7 +275,10 @@ function handleMessage(
         ws.send(encodeMessage({ type: "error", code: "INVALID_CHANNEL", message: "Channel must start with # and be under 50 chars" }));
         break;
       }
-      state.channels.join(user, msg.channel);
+      if (!state.channels.join(user, msg.channel)) {
+        ws.send(encodeMessage({ type: "error", code: "TOO_MANY_CHANNELS", message: "Server channel limit reached" }));
+        break;
+      }
       broadcast(state, msg.channel, encodeMessage({
         type: "join",
         channel: msg.channel,
@@ -273,6 +314,12 @@ function handleMessage(
       }
 
       const dmChannel = dmChannelName(user.id, msg.to);
+      // Track DM channel membership so history is accessible
+      state.channels.join(user, dmChannel);
+      // Find recipient user object for join
+      for (const [, u] of state.auth.authenticated) {
+        if (u.id === msg.to) { state.channels.join(u, dmChannel); break; }
+      }
       const dmMsg: Message = {
         id: crypto.randomUUID(),
         from: user.id,
@@ -296,8 +343,9 @@ function handleMessage(
       const oldNick = user.nick;
       const newNick = msg.nick.trim();
 
-      if (!newNick || newNick.length > 20) {
-        ws.send(encodeMessage({ type: "error", code: "INVALID_NICK", message: "Nick must be 1-20 chars" }));
+      // eslint-disable-next-line no-control-regex
+      if (!newNick || newNick.length > 20 || /[\x00-\x1f\x7f]/.test(newNick)) {
+        ws.send(encodeMessage({ type: "error", code: "INVALID_NICK", message: "Nick must be 1-20 printable chars" }));
         break;
       }
 

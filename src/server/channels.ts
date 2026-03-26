@@ -4,9 +4,10 @@ import type { User } from "../shared/types.ts";
 import type { Store } from "./store.ts";
 
 const DEFAULT_CHANNELS = ["#general", "#dev", "#help"];
+const MAX_CHANNELS = 50; // prevent unbounded channel creation
 
 export interface ChannelManager {
-  join(user: User, channel: string): void;
+  join(user: User, channel: string): boolean;
   part(user: User, channel: string): void;
   getMembers(channel: string): string[];
   getUserChannels(userId: string): string[];
@@ -23,11 +24,13 @@ export function createChannelManager(store: Store): ChannelManager {
   }
 
   return {
-    join(user: User, channel: string) {
+    join(user: User, channel: string): boolean {
       if (!members.has(channel)) {
+        if (members.size >= MAX_CHANNELS) return false;
         members.set(channel, new Set());
       }
       members.get(channel)!.add(user.id);
+      return true;
     },
 
     part(user: User, channel: string) {

@@ -1,6 +1,7 @@
 // Main app orchestrator — connects layout, widgets, keybindings, commands, server
 
 import cliCursor from "cli-cursor";
+import chalk from "chalk";
 import {
   createLayout,
   enterScreen,
@@ -93,6 +94,11 @@ interface AppState {
   connection: Connection | null;
   historySearchMode: boolean;
   historySearchQuery: string;
+  selfDnd: boolean; // suppress @mention highlights when in DND
+  globalHistory: History; // cross-buffer history for Ctrl+Up/Down
+  altJPending: boolean; // waiting for 2-digit buffer number after Alt+J
+  altJFirstDigit: string; // first digit captured
+  bareMode: boolean; // Alt+L: strip colors for bare display
 }
 
 function createInitialBuffers(): BufferState[] {
@@ -259,8 +265,8 @@ function handleServerMessage(
       // Hotlist if not active buffer
       if (idx !== state.activeIndex) {
         const h = state.buffers[idx]!.channel.hotlist;
-        // Check for @mention
-        if (chatMsg.content.includes(`@${state.selfNick}`)) {
+        // Check for @mention (suppressed in DND mode)
+        if (!state.selfDnd && chatMsg.content.includes(`@${state.selfNick}`)) {
           h.highlight++;
         } else if (chatMsg.channel.startsWith("dm:")) {
           h.private++;
@@ -484,6 +490,11 @@ export function startApp() {
     connection: null,
     historySearchMode: false,
     historySearchQuery: "",
+    selfDnd: false,
+    globalHistory: createHistory(),
+    altJPending: false,
+    altJFirstDigit: "",
+    bareMode: false,
   };
 
   if (!process.stdin.isTTY) {
@@ -602,6 +613,28 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
   const isCC = buf.bufferType === "cc_session";
   const conn = state.connection;
 
+  // Alt+J two-digit buffer select mode
+  if (state.altJPending) {
+    if (action.type === "char" && action.ch >= "0" && action.ch <= "9") {
+      if (state.altJFirstDigit === "") {
+        state.altJFirstDigit = action.ch;
+        state.inputState.prompt = `[Alt+J] ${action.ch}_: `;
+        return;
+      } else {
+        const bufNum = parseInt(state.altJFirstDigit + action.ch, 10);
+        state.altJPending = false;
+        state.altJFirstDigit = "";
+        state.inputState.prompt = `[${buf.channel.name}] `;
+        switchBuffer(state, bufNum - 1);
+        return;
+      }
+    }
+    // Any non-digit cancels
+    state.altJPending = false;
+    state.altJFirstDigit = "";
+    state.inputState.prompt = `[${buf.channel.name}] `;
+  }
+
   // Quit confirmation mode
   if (state.quitting) {
     if (action.type === "char" && (action.ch === "y" || action.ch === "Y")) {
@@ -662,7 +695,12 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
       if (!isCC) buf.chatScroll = Math.min(buf.chatScroll + layout.chat.h, buf.messages.length);
       break;
     case "page_down":
-      if (!isCC) buf.chatScroll = Math.max(0, buf.chatScroll - layout.chat.h);
+      if (!isCC) {
+        buf.chatScroll = Math.max(0, buf.chatScroll - layout.chat.h);
+        if (buf.chatScroll === 0 && buf.messages.length > 0) {
+          buf.readMarkerIndex = buf.messages.length - 1;
+        }
+      }
       break;
 
     case "alt_m":
@@ -670,12 +708,15 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
       if (state.mouseEnabled) enableMouse(); else disableMouse();
       break;
     case "alt_j":
-      // Buffer 10+ — next two digit keypresses would select buffer
-      // Simplified: no-op for now (buffer 10+ rare in MVP)
+      // Buffer 10+ — enter 2-digit mode
+      state.altJPending = true;
+      state.altJFirstDigit = "";
+      state.inputState.prompt = "[Alt+J] __: ";
       break;
     case "alt_l":
-      // Bare display mode — strip colors (toggle)
-      // Simplified: no-op for MVP
+      // Toggle bare display mode (strip colors)
+      state.bareMode = !state.bareMode;
+      chalk.level = state.bareMode ? 0 : 3;
       break;
     case "ctrl_r":
       state.historySearchMode = true;
@@ -687,7 +728,12 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
       if (!isCC) buf.chatScroll = Math.min(buf.chatScroll + 3, buf.messages.length);
       break;
     case "mouse_scroll_down":
-      if (!isCC) buf.chatScroll = Math.max(0, buf.chatScroll - 3);
+      if (!isCC) {
+        buf.chatScroll = Math.max(0, buf.chatScroll - 3);
+        if (buf.chatScroll === 0 && buf.messages.length > 0) {
+          buf.readMarkerIndex = buf.messages.length - 1;
+        }
+      }
       break;
     case "mouse_click": {
       const bounds = {
@@ -705,6 +751,25 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
         const clickRow = action.row - layout.buflist.y + buflistScroll;
         const clickedEntry = resolveClickedBuffer(entries, clickRow);
         if (clickedEntry !== null) switchBuffer(state, clickedEntry);
+      } else if (region === "nicklist") {
+        // Show rich presence of clicked user in statusbar
+        const clickedRow = action.row - layout.nicklist.y;
+        if (clickedRow >= 0 && clickedRow < state.users.length) {
+          const clickedUser = state.users[clickedRow];
+          if (clickedUser) {
+            const rich = clickedUser.richPresence;
+            const info = rich
+              ? `${clickedUser.nick} — ${rich.project}${rich.language ? ` · ${rich.language}` : ""}${rich.duration ? ` · ${rich.duration}m` : ""}`
+              : `${clickedUser.nick} — ${clickedUser.presence}`;
+            renderStatusbar(layout.statusbar, {
+              nick: state.selfNick,
+              status: info,
+              channel: buf.channel.name,
+            });
+            layout.render();
+            renderInput(layout.input, state.inputState);
+          }
+        }
       }
       break;
     }
@@ -758,6 +823,16 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
       if (next !== null) state.inputState = { ...state.inputState, text: next, cursor: next.length };
       break;
     }
+    case "ctrl_up": {
+      const prev = historyPrev(state.globalHistory, state.inputState.text);
+      if (prev !== null) state.inputState = { ...state.inputState, text: prev, cursor: prev.length };
+      break;
+    }
+    case "ctrl_down": {
+      const next = historyNext(state.globalHistory);
+      if (next !== null) state.inputState = { ...state.inputState, text: next, cursor: next.length };
+      break;
+    }
 
     case "tab": {
       if (state.completionCtx) {
@@ -785,6 +860,7 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
       if (isCC) break;
 
       historyAdd(buf.history, text);
+      historyAdd(state.globalHistory, text);
 
       if (text.startsWith("/")) {
         const result = handleCommand(text, buf.channel.name);
@@ -824,7 +900,8 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
               conn.send({ type: "nick", nick: sa.nick });
               break;
             case "dnd":
-              conn.send({ type: "presence", status: "dnd" });
+              state.selfDnd = !state.selfDnd;
+              conn.send({ type: "presence", status: state.selfDnd ? "dnd" : "online" });
               break;
             case "action":
               conn.send({ type: "action", channel: buf.channel.name, content: sa.content });

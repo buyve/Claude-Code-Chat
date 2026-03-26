@@ -9,6 +9,7 @@ interface PresenceEntry {
   richPresence?: RichPresence;
   lastSeen: number;
   graceTimer?: ReturnType<typeof setTimeout>;
+  generation: number; // prevents stale grace timers from overwriting fresh state
 }
 
 export interface PresenceManager {
@@ -29,10 +30,12 @@ export function createPresenceManager(): PresenceManager {
       if (existing?.graceTimer) {
         clearTimeout(existing.graceTimer);
       }
+      const gen = (existing?.generation ?? 0) + 1;
       entries.set(userId, {
         status,
         richPresence: rich,
         lastSeen: Date.now(),
+        generation: gen,
       });
     },
 
@@ -44,19 +47,28 @@ export function createPresenceManager(): PresenceManager {
       const entry = entries.get(userId);
       if (!entry) return;
 
-      // Start grace period
+      // Capture generation at disconnect time
+      const gen = entry.generation;
       entry.graceTimer = setTimeout(() => {
-        entry.status = "offline";
-        entry.graceTimer = undefined;
-        onOffline(userId);
+        // Only fire if generation hasn't changed (no reconnect happened)
+        const current = entries.get(userId);
+        if (current && current.generation === gen) {
+          current.status = "offline";
+          current.graceTimer = undefined;
+          onOffline(userId);
+        }
       }, OFFLINE_GRACE_MS);
     },
 
     reconnect(userId: string) {
       const entry = entries.get(userId);
-      if (entry?.graceTimer) {
-        clearTimeout(entry.graceTimer);
-        entry.graceTimer = undefined;
+      if (entry) {
+        if (entry.graceTimer) {
+          clearTimeout(entry.graceTimer);
+          entry.graceTimer = undefined;
+        }
+        // Bump generation to invalidate any pending grace timers
+        entry.generation++;
       }
     },
 

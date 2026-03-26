@@ -71,7 +71,7 @@ CCC_SERVER=ws://localhost:3337 ccc   # terminal 2
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CCC_SERVER` | `wss://ccc.fly.dev` | Server URL |
+| `CCC_SERVER` | `ws://localhost:3337` | Server URL (use `wss://` for remote) |
 | `CCC_PORT` | `3337` | Server port (server mode) |
 | `CCC_NICK` | auto-generated | Default nickname |
 | `CCC_DB_PATH` | `~/.config/ccc/server.db` | SQLite path |

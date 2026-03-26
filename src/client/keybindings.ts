@@ -26,6 +26,8 @@ export type Action =
   | { type: "alt_num"; num: number } // Alt+1-9
   | { type: "alt_left" }
   | { type: "alt_right" }
+  | { type: "ctrl_up" }
+  | { type: "ctrl_down" }
   | { type: "alt_m" }
   | { type: "alt_l" }
   | { type: "alt_j" }
@@ -91,6 +93,10 @@ export function parseInput(data: Buffer): Action[] {
         // Alt+Arrow: \x1b[1;3C (alt+right), \x1b[1;3D (alt+left)
         if (rest.startsWith("1;3C")) { actions.push({ type: "alt_right" }); i += 6; continue; }
         if (rest.startsWith("1;3D")) { actions.push({ type: "alt_left" }); i += 6; continue; }
+
+        // Ctrl+Arrow: \x1b[1;5A (ctrl+up), \x1b[1;5B (ctrl+down)
+        if (rest.startsWith("1;5A")) { actions.push({ type: "ctrl_up" }); i += 6; continue; }
+        if (rest.startsWith("1;5B")) { actions.push({ type: "ctrl_down" }); i += 6; continue; }
 
         // Skip unknown CSI
         const csiEnd = rest.search(/[A-Za-z~]/);
