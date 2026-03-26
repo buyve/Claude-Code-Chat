@@ -24,7 +24,14 @@ export interface Connection {
 
 export function createConnection(handler: ConnectionHandler): Connection {
   const url = process.env["CCC_SERVER"] ?? DEFAULT_URL;
-  const key = loadOrGenerateKey();
+  let key: ReturnType<typeof loadOrGenerateKey>;
+  try {
+    key = loadOrGenerateKey();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    handler.onStatusChange("disconnected", `SSH key error: ${msg}`);
+    return { send() {}, close() {}, getStatus: () => "disconnected" as ConnectionStatus };
+  }
   let ws: WebSocket | null = null;
   let status: ConnectionStatus = "disconnected";
   let reconnectDelay = RECONNECT_BASE;
@@ -47,28 +54,32 @@ export function createConnection(handler: ConnectionHandler): Connection {
     });
 
     ws.on("message", (data: WebSocket.Data) => {
-      const raw = typeof data === "string" ? data : data.toString("utf-8");
-      const msg = decodeMessage(raw);
-      if (!msg) return;
+      try {
+        const raw = typeof data === "string" ? data : data.toString("utf-8");
+        const msg = decodeMessage(raw);
+        if (!msg) return;
 
-      const serverMsg = msg as ServerMessage;
+        const serverMsg = msg as ServerMessage;
 
-      // Handle auth flow internally
-      if (serverMsg.type === "challenge") {
-        const signature = signChallenge(serverMsg.challenge, key.privatePath);
-        ws?.send(encodeMessage({
-          type: "auth",
-          publicKey: key.publicKey,
-          signature,
-        }));
-        return;
+        // Handle auth flow internally
+        if (serverMsg.type === "challenge") {
+          const signature = signChallenge(serverMsg.challenge, key.privatePath);
+          ws?.send(encodeMessage({
+            type: "auth",
+            publicKey: key.publicKey,
+            signature,
+          }));
+          return;
+        }
+
+        if (serverMsg.type === "auth_ok") {
+          setStatus("connected");
+        }
+
+        handler.onMessage(serverMsg);
+      } catch {
+        // Malformed message — ignore silently
       }
-
-      if (serverMsg.type === "auth_ok") {
-        setStatus("connected");
-      }
-
-      handler.onMessage(serverMsg);
     });
 
     ws.on("close", () => {
