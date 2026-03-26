@@ -158,6 +158,7 @@ export function createPresenceWatcher(): PresenceWatcher {
         clearInterval(timer);
         timer = null;
       }
+      handlers = [];
     },
 
     getSessions() {

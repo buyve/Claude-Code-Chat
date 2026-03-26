@@ -33,9 +33,18 @@ export function encodeMessage(msg: WSMessage): string {
   return JSON.stringify(msg);
 }
 
+const VALID_TYPES = new Set([
+  "auth", "chat", "action", "join", "part", "dm", "nick", "presence",
+  "challenge", "auth_ok", "auth_fail", "members", "history",
+  "nick_change", "presence_update", "error",
+]);
+
 export function decodeMessage(raw: string): WSMessage | null {
   try {
-    return JSON.parse(raw) as WSMessage;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || typeof parsed.type !== "string") return null;
+    if (!VALID_TYPES.has(parsed.type)) return null;
+    return parsed as WSMessage;
   } catch {
     return null;
   }

@@ -18,7 +18,7 @@ export interface CccConfig {
   publicKey: string;
 }
 
-const DEFAULT_SERVER = "wss://ccc.fly.dev";
+const DEFAULT_SERVER = "ws://localhost:3337";
 
 /** Check if config exists (not first run). */
 export function hasConfig(): boolean {

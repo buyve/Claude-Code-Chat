@@ -15,7 +15,8 @@ import {
   adjustBuflistScroll,
   type BuflistEntry,
 } from "./widgets/buflist.ts";
-import { renderChat, computeNickWidth, isAtBottom, renderCCSessionPlaceholder } from "./widgets/chat.ts";
+import { renderChat, isAtBottom, renderCCSessionPlaceholder } from "./widgets/chat.ts";
+import stringWidth from "string-width";
 import { renderNicklist, renderCCSessionMeta } from "./widgets/nicklist.ts";
 import {
   renderInput,
@@ -62,7 +63,7 @@ import type {
   CCSession,
 } from "../shared/types.ts";
 import { emptyHotlist } from "../shared/types.ts";
-import { createPresenceWatcher } from "../cc-integration/presence.ts";
+import { createPresenceWatcher, type DetectedSession } from "../cc-integration/presence.ts";
 import type { ChatState } from "./widgets/chat.ts";
 
 // --- App state ---
@@ -74,6 +75,7 @@ interface BufferState {
   readMarkerIndex: number;
   history: History;
   bufferType: BufferType;
+  cachedNickWidth: number; // cached to avoid recomputation
   ccSession?: CCSession;
 }
 
@@ -89,54 +91,16 @@ interface AppState {
   completionCtx: CompletionContext | null;
   connectionStatus: ConnectionStatus;
   connection: Connection | null;
-}
-
-function createDummyCCSessions(): CCSession[] {
-  return [
-    {
-      id: "session-1",
-      project: "ccc",
-      language: "TypeScript",
-      cwd: `${process.env["HOME"] ?? "/home/user"}/projects/CCC`,
-      startedAt: Date.now() - 45 * 60000,
-      active: true,
-    },
-    {
-      id: "session-2",
-      project: "api-server",
-      language: "Go",
-      cwd: `${process.env["HOME"] ?? "/home/user"}/projects/api-server`,
-      startedAt: Date.now() - 120 * 60000,
-      active: true,
-    },
-  ];
+  historySearchMode: boolean;
+  historySearchQuery: string;
 }
 
 function createInitialBuffers(): BufferState[] {
-  const buffers: BufferState[] = [];
-
-  // Start with #general — server will send history on auth
-  buffers.push({
-    channel: {
-      name: "#general",
-      topic: "General chat",
-      members: [],
-      hotlist: emptyHotlist(),
-    },
-    messages: [],
-    chatScroll: 0,
-    readMarkerIndex: -1,
-    history: createHistory(),
-    bufferType: "channel",
-  });
-
-  // CC Sessions (dummy)
-  const sessions = createDummyCCSessions();
-  for (const session of sessions) {
-    buffers.push({
+  return [
+    {
       channel: {
-        name: `⚡${session.project}`,
-        topic: `CC Session — ${session.cwd}`,
+        name: "#general",
+        topic: "General chat",
         members: [],
         hotlist: emptyHotlist(),
       },
@@ -144,20 +108,63 @@ function createInitialBuffers(): BufferState[] {
       chatScroll: 0,
       readMarkerIndex: -1,
       history: createHistory(),
-      bufferType: "cc_session",
-      ccSession: session,
-    });
+      bufferType: "channel",
+      cachedNickWidth: 4,
+    },
+  ];
+}
+
+/** Sync CC session buffers with detected sessions from PresenceWatcher. */
+function syncCCSessionBuffers(state: AppState, sessions: DetectedSession[]) {
+  // Remove CC session buffers that are no longer active
+  const activeIds = new Set(sessions.map((s) => s.sessionId));
+  for (let i = state.buffers.length - 1; i >= 0; i--) {
+    const buf = state.buffers[i]!;
+    if (buf.bufferType === "cc_session" && buf.ccSession && !activeIds.has(buf.ccSession.id)) {
+      // Adjust activeIndex if needed
+      if (state.activeIndex > i) state.activeIndex--;
+      else if (state.activeIndex === i) state.activeIndex = Math.max(0, i - 1);
+      state.buffers.splice(i, 1);
+    }
   }
 
-  return buffers;
+  // Add new CC session buffers
+  for (const session of sessions) {
+    const exists = state.buffers.some(
+      (b) => b.bufferType === "cc_session" && b.ccSession?.id === session.sessionId,
+    );
+    if (!exists) {
+      const ccSession: CCSession = {
+        id: session.sessionId,
+        project: session.project,
+        language: session.language,
+        cwd: session.cwd,
+        startedAt: session.startedAt,
+        active: true,
+      };
+      state.buffers.push({
+        channel: {
+          name: `⚡${session.project}`,
+          topic: `CC Session — ${session.cwd}`,
+          members: [],
+          hotlist: emptyHotlist(),
+        },
+        messages: [],
+        chatScroll: 0,
+        readMarkerIndex: -1,
+        history: createHistory(),
+        bufferType: "cc_session",
+        cachedNickWidth: 4,
+        ccSession,
+      });
+    }
+  }
 }
 
 // --- Buffer helpers ---
 
 function findBufferByChannel(state: AppState, channel: string): number {
-  return state.buffers.findIndex(
-    (b) => b.channel.name === channel || b.channel.name === channel,
-  );
+  return state.buffers.findIndex((b) => b.channel.name === channel);
 }
 
 function getOrCreateBuffer(state: AppState, channel: string, topic = ""): number {
@@ -167,9 +174,11 @@ function getOrCreateBuffer(state: AppState, channel: string, topic = ""): number
   // Determine buffer type
   const bufferType: BufferType = channel.startsWith("dm:") ? "dm" : "channel";
 
+  // Insert before CC session buffers, or at end if none exist
+  const ccIdx = state.buffers.findIndex((b) => b.bufferType === "cc_session");
+  const insertIdx = ccIdx >= 0 ? ccIdx : state.buffers.length;
   state.buffers.splice(
-    // Insert before CC session buffers
-    state.buffers.findIndex((b) => b.bufferType === "cc_session"),
+    insertIdx,
     0,
     {
       channel: {
@@ -183,11 +192,23 @@ function getOrCreateBuffer(state: AppState, channel: string, topic = ""): number
       readMarkerIndex: -1,
       history: createHistory(),
       bufferType,
+      cachedNickWidth: 4,
     },
   );
 
   // Recalculate index since we inserted before CC buffers
   return findBufferByChannel(state, channel);
+}
+
+/** Push a message and update the cached nick width. */
+function pushMessage(buf: BufferState, msg: Message) {
+  buf.messages.push(msg);
+  if (msg.type === "chat" || msg.type === "action") {
+    const w = stringWidth(msg.fromNick);
+    if (w > buf.cachedNickWidth && w <= 16) {
+      buf.cachedNickWidth = w;
+    }
+  }
 }
 
 function buildBuflistEntries(buffers: BufferState[]): BuflistEntry[] {
@@ -233,7 +254,7 @@ function handleServerMessage(
     case "chat": {
       const chatMsg = msg.message;
       const idx = getOrCreateBuffer(state, chatMsg.channel);
-      state.buffers[idx]!.messages.push(chatMsg);
+      pushMessage(state.buffers[idx]!, chatMsg);
 
       // Hotlist if not active buffer
       if (idx !== state.activeIndex) {
@@ -252,8 +273,9 @@ function handleServerMessage(
 
     case "join": {
       const idx = getOrCreateBuffer(state, msg.channel);
+      const joinBuf = state.buffers[idx]!;
       // Add join message
-      state.buffers[idx]!.messages.push({
+      joinBuf.messages.push({
         id: crypto.randomUUID(),
         from: msg.user.id,
         fromNick: msg.user.nick,
@@ -262,6 +284,11 @@ function handleServerMessage(
         timestamp: Date.now(),
         type: "join",
       });
+
+      // Add to channel members
+      if (!joinBuf.channel.members.includes(msg.user.id)) {
+        joinBuf.channel.members.push(msg.user.id);
+      }
 
       // Update user list
       if (!state.users.find((u) => u.id === msg.user.id)) {
@@ -283,8 +310,18 @@ function handleServerMessage(
           type: "part",
         });
       }
-      // Remove from users if they left all channels
-      state.users = state.users.filter((u) => u.id !== msg.userId);
+      // Remove user from channel members list
+      const buf23 = state.buffers[idx >= 0 ? idx : 0];
+      if (buf23) {
+        buf23.channel.members = buf23.channel.members.filter((id) => id !== msg.userId);
+      }
+      // Only remove from users if not in any other buffer
+      const stillInSomeBuffer = state.buffers.some(
+        (b) => b.channel.members.includes(msg.userId),
+      );
+      if (!stillInSomeBuffer) {
+        state.users = state.users.filter((u) => u.id !== msg.userId);
+      }
       break;
     }
 
@@ -306,11 +343,15 @@ function handleServerMessage(
 
     case "history": {
       const idx = getOrCreateBuffer(state, msg.channel);
-      // Prepend history (older messages first)
-      state.buffers[idx]!.messages = [
-        ...msg.messages,
-        ...state.buffers[idx]!.messages,
-      ];
+      const histBuf = state.buffers[idx]!;
+      histBuf.messages = [...msg.messages, ...histBuf.messages];
+      // Recompute nick width from history
+      for (const m of msg.messages) {
+        if (m.type === "chat" || m.type === "action") {
+          const w = stringWidth(m.fromNick);
+          if (w > histBuf.cachedNickWidth && w <= 16) histBuf.cachedNickWidth = w;
+        }
+      }
       break;
     }
 
@@ -407,7 +448,7 @@ function renderAll(layout: Layout, state: AppState) {
     const chatState: ChatState = {
       messages: buf.messages,
       selfNick: state.selfNick,
-      nickWidth: computeNickWidth(buf.messages),
+      nickWidth: buf.cachedNickWidth,
       scrollOffset: buf.chatScroll,
       readMarkerIndex: buf.readMarkerIndex,
       isActive: true,
@@ -432,7 +473,7 @@ export function startApp() {
   const state: AppState = {
     buffers: createInitialBuffers(),
     activeIndex: 0,
-    selfNick: "connecting...",
+    selfNick: process.env["CCC_NICK"] ?? "me",
     selfId: "",
     users: [],
     mouseEnabled: false,
@@ -441,6 +482,8 @@ export function startApp() {
     completionCtx: null,
     connectionStatus: "disconnected",
     connection: null,
+    historySearchMode: false,
+    historySearchQuery: "",
   };
 
   if (!process.stdin.isTTY) {
@@ -484,16 +527,25 @@ export function startApp() {
   });
   state.connection = conn;
 
-  // Start CC session presence watcher
+  // Start CC session presence watcher — only send after auth
   const presenceWatcher = createPresenceWatcher();
-  presenceWatcher.onChange((status, rich) => {
-    conn.send({ type: "presence", status, rich });
+  presenceWatcher.onChange((status, rich, sessions) => {
+    if (state.connectionStatus === "connected") {
+      conn.send({ type: "presence", status, rich });
+    }
+    // Dynamically update CC session buffers
+    if (sessions) {
+      syncCCSessionBuffers(state, sessions);
+    }
     renderAll(layout, state);
   });
   presenceWatcher.start();
 
-  // Cleanup on exit
+  // Cleanup on exit — guard against double invocation
+  let cleaned = false;
   function cleanup() {
+    if (cleaned) return;
+    cleaned = true;
     presenceWatcher.stop();
     conn.close();
     if (state.mouseEnabled) disableMouse();
@@ -512,6 +564,12 @@ export function startApp() {
 
   // Resize
   process.stdout.on("resize", () => {
+    if (isTooSmall()) {
+      // Don't render — just show warning in alternate screen
+      process.stdout.write("\x1b[2J\x1b[H");
+      process.stdout.write("Terminal too small. Minimum 80x24 required.\r\n");
+      return;
+    }
     layout.recalculate();
     process.stdout.write("\x1b[2J");
     renderAll(layout, state);
@@ -557,6 +615,34 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
     return;
   }
 
+  // Ctrl+R history search mode
+  if (state.historySearchMode) {
+    if (action.type === "char") {
+      state.historySearchQuery += action.ch;
+      const match = buf.history.entries.find((e) =>
+        e.toLowerCase().includes(state.historySearchQuery.toLowerCase()),
+      );
+      if (match) {
+        state.inputState = { ...state.inputState, text: match, cursor: match.length };
+      }
+      state.inputState.prompt = `(search) '${state.historySearchQuery}': `;
+      return;
+    } else if (action.type === "backspace") {
+      state.historySearchQuery = state.historySearchQuery.slice(0, -1);
+      state.inputState.prompt = `(search) '${state.historySearchQuery}': `;
+      return;
+    } else if (action.type === "enter" || action.type === "ctrl_r") {
+      // Accept or cycle
+      state.historySearchMode = false;
+      state.inputState.prompt = `[${buf.channel.name}] `;
+      return;
+    } else {
+      // Any other key exits search
+      state.historySearchMode = false;
+      state.inputState.prompt = `[${buf.channel.name}] `;
+    }
+  }
+
   if (action.type !== "tab") {
     state.completionCtx = null;
   }
@@ -583,6 +669,20 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
       state.mouseEnabled = !state.mouseEnabled;
       if (state.mouseEnabled) enableMouse(); else disableMouse();
       break;
+    case "alt_j":
+      // Buffer 10+ — next two digit keypresses would select buffer
+      // Simplified: no-op for now (buffer 10+ rare in MVP)
+      break;
+    case "alt_l":
+      // Bare display mode — strip colors (toggle)
+      // Simplified: no-op for MVP
+      break;
+    case "ctrl_r":
+      state.historySearchMode = true;
+      state.historySearchQuery = "";
+      state.inputState.prompt = "(search) '': ";
+      break;
+
     case "mouse_scroll_up":
       if (!isCC) buf.chatScroll = Math.min(buf.chatScroll + 3, buf.messages.length);
       break;
@@ -599,7 +699,10 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
       const region = identifyRegion(action.col, action.row, bounds);
       if (region === "buflist") {
         const entries = buildBuflistEntries(state.buffers);
-        const clickRow = action.row - layout.buflist.y;
+        const buflistScroll = adjustBuflistScroll(
+          entries, state.activeIndex, 0, layout.buflist.h,
+        );
+        const clickRow = action.row - layout.buflist.y + buflistScroll;
         const clickedEntry = resolveClickedBuffer(entries, clickRow);
         if (clickedEntry !== null) switchBuffer(state, clickedEntry);
       }
@@ -663,7 +766,9 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
         state.inputState = { ...state.inputState, text: result.text, cursor: result.cursor };
       } else {
         const nicks = state.users.map((u) => u.nick);
-        const channels = state.buffers.map((b) => b.channel.name);
+        const channels = state.buffers
+          .filter((b) => b.bufferType !== "cc_session")
+          .map((b) => b.channel.name);
         const ctx = tabComplete(state.inputState.text, state.inputState.cursor, nicks, channels, COMMANDS);
         if (ctx) {
           state.completionCtx = ctx;
@@ -726,10 +831,9 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
               break;
           }
         } else if (result.messages) {
-          // Local-only messages (e.g. /help)
           for (const msg of result.messages) {
             msg.channel = buf.channel.name;
-            buf.messages.push(msg);
+            pushMessage(buf, msg);
           }
         }
       } else {

@@ -34,6 +34,7 @@ export interface ChatState {
 // Formatted line ready for rendering
 interface ChatLine {
   text: string;
+  centered?: boolean;
 }
 
 // Compute the nick alignment width (max nick length in current messages)
@@ -161,10 +162,17 @@ function formatMessage(
 ): ChatLine[] {
   const lines: ChatLine[] = [];
 
+  // Handle date_change type specially — before auto date detection to avoid duplication
+  if (msg.type === "date_change") {
+    const dateStr = formatDateChange(msg.timestamp);
+    lines.push({ text: DATE_CHANGE_STYLE(`── ${dateStr} ──`), centered: true });
+    return lines;
+  }
+
   // Date change detection
   if (prevMsg && !isSameDay(prevMsg.timestamp, msg.timestamp)) {
     const dateStr = formatDateChange(msg.timestamp);
-    lines.push({ text: DATE_CHANGE_STYLE(`── ${dateStr} ──`) });
+    lines.push({ text: DATE_CHANGE_STYLE(`── ${dateStr} ──`), centered: true });
   }
 
   // Timestamp (elide if same minute as previous)
@@ -172,13 +180,6 @@ function formatMessage(
   const timeStr = showTime
     ? TIMESTAMP_STYLE(formatTimestamp(msg.timestamp))
     : "     "; // 5 chars blank (HH:MM)
-
-  // Handle date_change type specially
-  if (msg.type === "date_change") {
-    const dateStr = formatDateChange(msg.timestamp);
-    lines.push({ text: DATE_CHANGE_STYLE(`── ${dateStr} ──`) });
-    return lines;
-  }
 
   const prefix = getPrefix(msg.type);
 
@@ -281,7 +282,14 @@ export function renderChat(region: Region, state: ChatState) {
   for (let row = 0; row < visibleRows; row++) {
     const lineIdx = topIndex + row;
     if (lineIdx >= endIndex) break;
-    region.writeLine(row, allLines[lineIdx]!.text);
+    const line = allLines[lineIdx]!;
+    if (line.centered) {
+      const rawLen = stringWidth(line.text);
+      const pad = Math.max(0, Math.floor((region.w - rawLen) / 2));
+      region.writeLine(row, " ".repeat(pad) + line.text);
+    } else {
+      region.writeLine(row, line.text);
+    }
   }
 
   // Scroll indicators

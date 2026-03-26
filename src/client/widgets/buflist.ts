@@ -110,20 +110,13 @@ export function adjustBuflistScroll(
   visibleRows: number,
 ): number {
   const lines = buildLines(entries, activeIndex);
-  // Find the line index for the active buffer
+  // Find the line index for the active buffer by matching the prefix marker
+  const marker = ` ${activeIndex + 1}. `;
   let activeLine = 0;
   for (let i = 0; i < lines.length; i++) {
-    if (!lines[i]!.isHeader) {
-      // Check if this line corresponds to the active entry
-      const entry = entries.find(
-        (e) =>
-          e.globalIndex === activeIndex &&
-          lines[i]!.text.includes(`${activeIndex + 1}.`),
-      );
-      if (entry) {
-        activeLine = i;
-        break;
-      }
+    if (!lines[i]!.isHeader && lines[i]!.text.includes(marker)) {
+      activeLine = i;
+      break;
     }
   }
 

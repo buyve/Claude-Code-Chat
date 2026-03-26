@@ -107,7 +107,7 @@ export function startServer(dbPath?: string) {
 
           const userChannels = state.channels.getUserChannels(user.id);
           for (const ch of userChannels) {
-            state.channels.part(user, ch);
+            // Broadcast before part so members still includes the user's channel
             broadcast(state, ch, encodeMessage({
               type: "part",
               channel: ch,
@@ -115,6 +115,7 @@ export function startServer(dbPath?: string) {
               nick: user.nick,
               message: "Connection lost",
             }));
+            state.channels.part(user, ch);
           }
         }
       },
@@ -198,6 +199,10 @@ function handleMessage(
 
   switch (msg.type) {
     case "chat": {
+      if (msg.content.length > 4096) {
+        ws.send(encodeMessage({ type: "error", code: "MSG_TOO_LONG", message: "Message exceeds 4096 characters" }));
+        break;
+      }
       const chatMsg: Message = {
         id: crypto.randomUUID(),
         from: user.id,
@@ -228,6 +233,10 @@ function handleMessage(
     }
 
     case "join": {
+      if (!msg.channel.startsWith("#") || msg.channel.length > 50) {
+        ws.send(encodeMessage({ type: "error", code: "INVALID_CHANNEL", message: "Channel must start with # and be under 50 chars" }));
+        break;
+      }
       state.channels.join(user, msg.channel);
       broadcast(state, msg.channel, encodeMessage({
         type: "join",
@@ -257,6 +266,12 @@ function handleMessage(
     }
 
     case "dm": {
+      const recipientSockets = findSockets(msg.to, state.auth);
+      if (recipientSockets.length === 0) {
+        ws.send(encodeMessage({ type: "error", code: "USER_NOT_FOUND", message: "User not online" }));
+        break;
+      }
+
       const dmChannel = dmChannelName(user.id, msg.to);
       const dmMsg: Message = {
         id: crypto.randomUUID(),
@@ -269,8 +284,6 @@ function handleMessage(
       };
       state.store.addMessage(dmMsg);
 
-      // Send to recipient
-      const recipientSockets = findSockets(msg.to, state.auth);
       for (const s of recipientSockets) {
         s.send(encodeMessage({ type: "chat", message: dmMsg }));
       }
@@ -311,6 +324,11 @@ function handleMessage(
     }
 
     case "presence": {
+      const VALID_STATUSES = ["online", "coding", "reviewing", "dnd", "offline"];
+      if (!VALID_STATUSES.includes(msg.status)) {
+        ws.send(encodeMessage({ type: "error", code: "INVALID_STATUS", message: `Invalid presence: ${msg.status}` }));
+        break;
+      }
       user.presence = msg.status;
       if (msg.rich) user.richPresence = msg.rich;
 

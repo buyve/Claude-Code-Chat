@@ -151,7 +151,7 @@ export function createStore(dbPath?: string): Store {
 
     nickExists(nick: string, excludeUserId = ""): boolean {
       const row = checkNickExists.get(nick, excludeUserId);
-      return row !== null;
+      return row != null;
     },
 
     close() {

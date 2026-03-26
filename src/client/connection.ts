@@ -5,7 +5,7 @@ import { loadOrGenerateKey, signChallenge } from "../shared/crypto.ts";
 import { encodeMessage, decodeMessage } from "../shared/protocol.ts";
 import type { ClientMessage, ServerMessage } from "../shared/protocol.ts";
 
-const DEFAULT_URL = "wss://first-con-seeker-cornell.trycloudflare.com";
+const DEFAULT_URL = "ws://localhost:3337";
 const RECONNECT_BASE = 1000;
 const RECONNECT_MAX = 16000;
 
@@ -116,9 +116,15 @@ export function createConnection(handler: ConnectionHandler): Connection {
 
     close() {
       closed = true;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      ws?.close();
-      ws = null;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+      setStatus("disconnected");
     },
 
     getStatus() {

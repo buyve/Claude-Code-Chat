@@ -25,8 +25,9 @@ export function createHistory(maxSize = 100): History {
 }
 
 export function historyAdd(h: History, text: string) {
-  // Duplicate prevention
-  if (h.entries.length > 0 && h.entries[0] === text) return;
+  // Duplicate prevention — remove existing occurrence, then prepend
+  const existing = h.entries.indexOf(text);
+  if (existing !== -1) h.entries.splice(existing, 1);
   h.entries.unshift(text);
   if (h.entries.length > h.maxSize) h.entries.pop();
   h.index = -1;
@@ -63,6 +64,7 @@ export interface CompletionContext {
   cycleIndex: number;
   startPos: number;
   prefix: string;
+  appliedLength: number; // length of the currently applied candidate (including suffix)
 }
 
 export function tabComplete(
@@ -100,7 +102,7 @@ export function tabComplete(
 
   if (candidates.length === 0) return null;
 
-  return { candidates, cycleIndex: 0, startPos: start, prefix };
+  return { candidates, cycleIndex: 0, startPos: start, prefix, appliedLength: prefix.length };
 }
 
 export function applyCompletion(
@@ -111,11 +113,14 @@ export function applyCompletion(
   if (!candidate) return { text, cursor: text.length };
 
   const before = text.slice(0, ctx.startPos);
-  const after = text.slice(ctx.startPos + ctx.prefix.length);
+  const after = text.slice(ctx.startPos + ctx.appliedLength);
   // Add space after completion if at end of input
   const suffix = after.length === 0 ? " " : "";
   const newText = before + candidate + suffix + after;
   const newCursor = ctx.startPos + candidate.length + suffix.length;
+
+  // Track the applied length for next cycle
+  ctx.appliedLength = candidate.length + suffix.length;
 
   return { text: newText, cursor: newCursor };
 }

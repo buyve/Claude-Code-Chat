@@ -32,10 +32,16 @@ if (args[0] === "server") {
 }
 
 // Start client — check for first-run onboarding
-import { hasConfig, runOnboarding } from "../src/client/onboarding.ts";
+import { hasConfig, loadConfig, runOnboarding } from "../src/client/onboarding.ts";
 import { startApp } from "../src/client/app.ts";
 
 if (!hasConfig()) {
   await runOnboarding();
 }
+
+// Apply config to env so connection.ts and app.ts pick them up
+const config = loadConfig();
+if (!process.env["CCC_SERVER"]) process.env["CCC_SERVER"] = config.server;
+if (!process.env["CCC_NICK"]) process.env["CCC_NICK"] = config.nick;
+
 startApp();
