@@ -17,7 +17,7 @@ import {
   adjustBuflistScroll,
   type BuflistEntry,
 } from "./widgets/buflist.ts";
-import { renderChat, isAtBottom, renderCCSessionPlaceholder, getVisibleLines } from "./widgets/chat.ts";
+import { renderChat, isAtBottom, renderCCSessionPlaceholder, getVisibleLines, extractURLs } from "./widgets/chat.ts";
 import stringWidth from "string-width";
 import { renderNicklist, renderCCSessionMeta, resolveNicklistClick } from "./widgets/nicklist.ts";
 import {
@@ -50,7 +50,7 @@ import {
   identifyRegion,
   type Action,
 } from "./keybindings.ts";
-import { handleCommand, COMMANDS } from "./commands.ts";
+import { handleCommand, formatWhois, COMMANDS, type ClientAction } from "./commands.ts";
 import {
   createConnection,
   type Connection,
@@ -68,6 +68,8 @@ import { emptyHotlist } from "../shared/types.ts";
 import { createPresenceWatcher, type DetectedSession } from "../cc-integration/presence.ts";
 import { createCCTerminal, type CCTerminal } from "../cc-integration/pty.ts";
 import type { ChatState } from "./widgets/chat.ts";
+import { sendNotification } from "./notify.ts";
+import { logMessage } from "./logger.ts";
 import {
   createSelection,
   startSelection,
@@ -117,6 +119,10 @@ interface AppState {
   ccTerminals: Map<string, CCTerminal>;
   ccActive: boolean; // true when CC buffer is focused and PTY has input
   selection: SelectionState;
+  ignoreList: Set<string>; // ignored nicks
+  typingNick?: string; // nick currently typing in active channel
+  typingTimer?: ReturnType<typeof setTimeout>;
+  lastTypingSent?: number; // debounce outgoing typing indicator
 }
 
 // Default CC session ID prefix — not removed by syncCCSessionBuffers
@@ -353,6 +359,116 @@ function extractCCSelectedText(state: AppState, layout: Layout): string | null {
   return result.length > 0 ? result.join("\n") : null;
 }
 
+/** Handle client-only actions from slash commands */
+function handleClientAction(
+  action: ClientAction,
+  state: AppState,
+  buf: BufferState,
+  layout: Layout,
+) {
+  switch (action.type) {
+    case "ignore":
+      state.ignoreList.add(action.nick.toLowerCase());
+      break;
+    case "unignore":
+      state.ignoreList.delete(action.nick.toLowerCase());
+      break;
+    case "buffer_close": {
+      if (state.buffers.length <= 1) {
+        pushMessage(buf, {
+          id: crypto.randomUUID(), from: "", fromNick: "",
+          channel: buf.channel.name,
+          content: "Cannot close the last buffer",
+          timestamp: Date.now(), type: "error",
+        });
+        return;
+      }
+      const idx = state.activeIndex;
+      state.buffers.splice(idx, 1);
+      state.activeIndex = Math.min(idx, state.buffers.length - 1);
+      const newBuf = state.buffers[state.activeIndex]!;
+      state.inputState.prompt = `[${displayName(newBuf, state)}] `;
+      break;
+    }
+    case "search": {
+      // /whois nick
+      if (action.query.startsWith("__whois__")) {
+        const nick = action.query.slice(9);
+        const user = state.users.find(
+          (u) => u.nick.toLowerCase() === nick.toLowerCase(),
+        );
+        if (user) {
+          for (const msg of formatWhois(user)) {
+            msg.channel = buf.channel.name;
+            pushMessage(buf, msg);
+          }
+        } else {
+          pushMessage(buf, {
+            id: crypto.randomUUID(), from: "", fromNick: "",
+            channel: buf.channel.name,
+            content: `User '${nick}' not found`,
+            timestamp: Date.now(), type: "error",
+          });
+        }
+        return;
+      }
+      // /list
+      if (action.query === "__list__") {
+        const lines = state.buffers
+          .filter((b) => b.bufferType === "channel")
+          .map((b) => `  ${b.channel.name} (${b.channel.members.length} members) — ${b.channel.topic || "(no topic)"}`);
+        if (lines.length === 0) lines.push("  No channels");
+        pushMessage(buf, {
+          id: crypto.randomUUID(), from: "", fromNick: "",
+          channel: buf.channel.name, content: "Channels:",
+          timestamp: Date.now(), type: "network",
+        });
+        for (const l of lines) {
+          pushMessage(buf, {
+            id: crypto.randomUUID(), from: "", fromNick: "",
+            channel: buf.channel.name, content: l,
+            timestamp: Date.now(), type: "network",
+          });
+        }
+        return;
+      }
+      // /search pattern — highlight matches in current buffer
+      const query = action.query.toLowerCase();
+      const matches = buf.messages.filter(
+        (m) => m.content.toLowerCase().includes(query) ||
+               m.fromNick.toLowerCase().includes(query),
+      );
+      if (matches.length === 0) {
+        pushMessage(buf, {
+          id: crypto.randomUUID(), from: "", fromNick: "",
+          channel: buf.channel.name,
+          content: `No results for '${action.query}'`,
+          timestamp: Date.now(), type: "network",
+        });
+      } else {
+        pushMessage(buf, {
+          id: crypto.randomUUID(), from: "", fromNick: "",
+          channel: buf.channel.name,
+          content: `Found ${matches.length} result(s) for '${action.query}':`,
+          timestamp: Date.now(), type: "network",
+        });
+        for (const m of matches.slice(-10)) {
+          const ts = new Date(m.timestamp).toLocaleTimeString("en", {
+            hour: "2-digit", minute: "2-digit",
+          });
+          pushMessage(buf, {
+            id: crypto.randomUUID(), from: "", fromNick: "",
+            channel: buf.channel.name,
+            content: `  [${ts}] <${m.fromNick}> ${m.content}`,
+            timestamp: Date.now(), type: "network",
+          });
+        }
+      }
+      break;
+    }
+  }
+}
+
 function buildBuflistEntries(state: AppState): BuflistEntry[] {
   return state.buffers.map((buf, i) => ({
     name: displayName(buf, state),
@@ -402,17 +518,24 @@ function handleServerMessage(
 
     case "chat": {
       const chatMsg = msg.message;
+      // Ignore filter
+      if (state.ignoreList.has(chatMsg.fromNick.toLowerCase())) break;
       const idx = getOrCreateBuffer(state, chatMsg.channel);
       pushMessage(state.buffers[idx]!, chatMsg);
 
-      // Hotlist if not active buffer
+      // Log to file
+      logMessage(chatMsg);
+
+      // Hotlist + notifications if not active buffer
       if (idx !== state.activeIndex) {
         const h = state.buffers[idx]!.channel.hotlist;
-        // Check for @mention (suppressed in DND mode)
-        if (!state.selfDnd && chatMsg.content.includes(`@${state.selfNick}`)) {
+        const isMention = !state.selfDnd && chatMsg.content.includes(`@${state.selfNick}`);
+        if (isMention) {
           h.highlight++;
+          sendNotification(chatMsg.channel, `${chatMsg.fromNick}: ${chatMsg.content}`);
         } else if (chatMsg.channel.startsWith("dm:")) {
           h.private++;
+          sendNotification(`DM from ${chatMsg.fromNick}`, chatMsg.content);
         } else {
           h.message++;
         }
@@ -543,6 +666,35 @@ function handleServerMessage(
       break;
     }
 
+    case "topic_change": {
+      const idx = findBufferByChannel(state, msg.channel);
+      if (idx >= 0) {
+        state.buffers[idx]!.channel.topic = msg.topic;
+        pushMessage(state.buffers[idx]!, {
+          id: crypto.randomUUID(), from: "", fromNick: msg.nick,
+          channel: msg.channel,
+          content: `${msg.nick} changed topic to: ${msg.topic}`,
+          timestamp: Date.now(), type: "network",
+        });
+      }
+      break;
+    }
+
+    case "typing": {
+      // Show typing indicator in statusbar (clear after 3 seconds)
+      const activeBuf = state.buffers[state.activeIndex]!;
+      if (msg.channel === activeBuf.channel.name) {
+        state.typingNick = msg.nick;
+        if (state.typingTimer) clearTimeout(state.typingTimer);
+        state.typingTimer = setTimeout(() => {
+          state.typingNick = undefined;
+          state.typingTimer = undefined;
+          scheduleRender();
+        }, 3000);
+      }
+      break;
+    }
+
     case "error": {
       // Show error in current buffer
       const buf = state.buffers[state.activeIndex]!;
@@ -573,12 +725,13 @@ function renderAll(layout: Layout, state: AppState) {
     topic: buf.channel.topic,
   });
 
-  const statusText =
+  let statusText =
     state.connectionStatus === "connected"
       ? "Connected"
       : state.connectionStatus === "connecting"
         ? "Connecting..."
         : "Disconnected";
+  if (state.typingNick) statusText = `${state.typingNick} is typing...`;
 
   renderStatusbar(layout.statusbar, {
     nick: state.selfNick,
@@ -683,6 +836,7 @@ export function startApp() {
     ccTerminals: new Map(),
     ccActive: false,
     selection: createSelection(),
+    ignoreList: new Set(),
   };
 
   if (!process.stdin.isTTY) {
@@ -1204,6 +1358,22 @@ function handleAction(action: Action, layout: Layout, state: AppState, onRender?
           renderInput(layout.input, state.inputState);
           layout.flush();
         }
+      } else if (region === "chat") {
+        // Click in chat: open URL if the clicked line contains one
+        const chatRow = action.row - layout.chat.y;
+        const chatState: ChatState = {
+          messages: buf.messages, selfNick: state.selfNick,
+          nickWidth: buf.cachedNickWidth, scrollOffset: buf.chatScroll,
+          readMarkerIndex: buf.readMarkerIndex, isActive: true,
+        };
+        const lines = getVisibleLines(chatState, layout.chat.w, layout.chat.h);
+        if (chatRow >= 0 && chatRow < lines.length) {
+          const urls = extractURLs(lines[chatRow]!);
+          if (urls.length > 0) {
+            const cmd = process.platform === "darwin" ? "open" : "xdg-open";
+            try { Bun.spawn([cmd, urls[0]!]); } catch { /* no opener */ }
+          }
+        }
       }
       break;
     }
@@ -1216,6 +1386,14 @@ function handleAction(action: Action, layout: Layout, state: AppState, onRender?
 
     case "char":
       state.inputState = insertChar(state.inputState, action.ch);
+      // Send typing indicator (debounced, max once per 2s)
+      if (conn && !isCC) {
+        const now = Date.now();
+        if (!state.lastTypingSent || now - state.lastTypingSent > 2000) {
+          conn.send({ type: "typing", channel: buf.channel.name });
+          state.lastTypingSent = now;
+        }
+      }
       break;
     case "backspace":
       state.inputState = deleteBack(state.inputState);
@@ -1313,8 +1491,12 @@ function handleAction(action: Action, layout: Layout, state: AppState, onRender?
           }
         }
       } else if (text.startsWith("/")) {
-        // Channel/DM slash commands
         const result = handleCommand(text, buf.channel.name);
+        // Handle client-side actions
+        if (result.clientAction) {
+          handleClientAction(result.clientAction, state, buf, layout);
+        }
+        // Handle server actions
         if (result.serverAction && conn) {
           const sa = result.serverAction;
           switch (sa.type) {
@@ -1329,7 +1511,7 @@ function handleAction(action: Action, layout: Layout, state: AppState, onRender?
               if (target) {
                 conn.send({ type: "dm", to: target.id, content: sa.content });
               } else {
-                buf.messages.push({
+                pushMessage(buf, {
                   id: crypto.randomUUID(), from: "", fromNick: "",
                   channel: buf.channel.name,
                   content: `User '${sa.nick}' not found`,
@@ -1348,8 +1530,13 @@ function handleAction(action: Action, layout: Layout, state: AppState, onRender?
             case "action":
               conn.send({ type: "action", channel: buf.channel.name, content: sa.content });
               break;
+            case "topic":
+              conn.send({ type: "topic", channel: sa.channel, topic: sa.topic });
+              break;
           }
-        } else if (result.messages) {
+        }
+        // Display local messages
+        if (result.messages) {
           for (const msg of result.messages) {
             msg.channel = buf.channel.name;
             pushMessage(buf, msg);

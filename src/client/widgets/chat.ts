@@ -138,11 +138,24 @@ function wrapLine(text: string, maxWidth: number): string[] {
   return result;
 }
 
+// URL detection pattern
+const URL_RE = /https?:\/\/[^\s<>'")\]]+/g;
+
+/** Underline URLs in text for visibility */
+function highlightURLs(text: string): string {
+  return text.replace(URL_RE, (url) => chalk.underline.blue(url));
+}
+
+/** Extract URLs from a plain text string */
+export function extractURLs(text: string): string[] {
+  return [...text.matchAll(URL_RE)].map((m) => m[0]);
+}
+
 /** Format content, detecting fenced code blocks and inline code. */
 function formatContentWithCodeBlocks(content: string): string[] {
-  // No code markers — split on newlines
+  // No code markers — split on newlines, highlight URLs
   if (!content.includes("`")) {
-    return content.split("\n");
+    return content.split("\n").map(highlightURLs);
   }
 
   // Handle inline code (single backticks, no newlines)
@@ -176,8 +189,10 @@ function formatContentWithCodeBlocks(content: string): string[] {
     if (inCodeBlock) {
       result.push(CODE_BORDER("│ ") + CODE_BG(colorizeCode(line)));
     } else {
-      // Handle inline code in non-block lines
-      const formatted = line.replace(/`([^`]+)`/g, (_, code) => INLINE_CODE(` ${code} `));
+      // Handle inline code in non-block lines, highlight URLs
+      const formatted = highlightURLs(
+        line.replace(/`([^`]+)`/g, (_, code) => INLINE_CODE(` ${code} `)),
+      );
       result.push(formatted);
     }
   }

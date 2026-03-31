@@ -11,7 +11,9 @@ export type ClientMessage =
   | { type: "part"; channel: string; message?: string }
   | { type: "dm"; to: string; content: string }
   | { type: "nick"; nick: string }
-  | { type: "presence"; status: PresenceStatus; rich?: RichPresence };
+  | { type: "presence"; status: PresenceStatus; rich?: RichPresence }
+  | { type: "topic"; channel: string; topic: string }
+  | { type: "typing"; channel: string };
 
 // Server -> Client messages
 export type ServerMessage =
@@ -25,6 +27,8 @@ export type ServerMessage =
   | { type: "history"; channel: string; messages: Message[] }
   | { type: "nick_change"; userId: string; oldNick: string; newNick: string }
   | { type: "presence_update"; userId: string; status: PresenceStatus; rich?: RichPresence }
+  | { type: "topic_change"; channel: string; topic: string; nick: string }
+  | { type: "typing"; channel: string; nick: string }
   | { type: "error"; code: string; message: string };
 
 export type WSMessage = ClientMessage | ServerMessage;
@@ -35,8 +39,9 @@ export function encodeMessage(msg: WSMessage): string {
 
 const VALID_TYPES = new Set([
   "auth", "chat", "action", "join", "part", "dm", "nick", "presence",
+  "topic", "typing",
   "challenge", "auth_ok", "auth_fail", "members", "history",
-  "nick_change", "presence_update", "error",
+  "nick_change", "presence_update", "topic_change", "error",
 ]);
 
 export function decodeMessage(raw: string): WSMessage | null {

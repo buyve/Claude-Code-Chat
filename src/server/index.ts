@@ -422,6 +422,33 @@ function handleMessage(
       break;
     }
 
+    case "topic": {
+      if (!msg.channel || typeof msg.topic !== "string") break;
+      if (!state.channels.exists(msg.channel)) {
+        ws.send(encodeMessage({ type: "error", code: "NOT_IN_CHANNEL", message: "Channel does not exist" }));
+        break;
+      }
+      // Broadcast topic change to all members
+      broadcast(state, msg.channel, encodeMessage({
+        type: "topic_change",
+        channel: msg.channel,
+        topic: stripAnsi(msg.topic).slice(0, 300),
+        nick: user.nick,
+      }));
+      break;
+    }
+
+    case "typing": {
+      if (!msg.channel) break;
+      // Broadcast typing indicator to channel (exclude sender)
+      broadcast(state, msg.channel, encodeMessage({
+        type: "typing",
+        channel: msg.channel,
+        nick: user.nick,
+      }), user.id);
+      break;
+    }
+
     case "presence": {
       const VALID_STATUSES = ["online", "coding", "reviewing", "dnd", "offline"];
       if (!VALID_STATUSES.includes(msg.status)) {
