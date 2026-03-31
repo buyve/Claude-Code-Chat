@@ -1,14 +1,15 @@
 // Main app orchestrator — connects layout, widgets, keybindings, commands, server
 
-import cliCursor from "cli-cursor";
 import chalk from "chalk";
 import {
   createLayout,
   enterScreen,
   exitScreen,
   isTooSmall,
+  fitToWidth,
   type Layout,
 } from "./layout.ts";
+import { createRenderScheduler } from "./render-scheduler.ts";
 import { renderTitlebar } from "./widgets/titlebar.ts";
 import { renderStatusbar } from "./widgets/statusbar.ts";
 import {
@@ -16,7 +17,7 @@ import {
   adjustBuflistScroll,
   type BuflistEntry,
 } from "./widgets/buflist.ts";
-import { renderChat, isAtBottom, renderCCSessionPlaceholder } from "./widgets/chat.ts";
+import { renderChat, isAtBottom, renderCCSessionPlaceholder, getVisibleLines } from "./widgets/chat.ts";
 import stringWidth from "string-width";
 import { renderNicklist, renderCCSessionMeta, resolveNicklistClick } from "./widgets/nicklist.ts";
 import {
@@ -65,7 +66,20 @@ import type {
 } from "../shared/types.ts";
 import { emptyHotlist } from "../shared/types.ts";
 import { createPresenceWatcher, type DetectedSession } from "../cc-integration/presence.ts";
+import { createCCTerminal, type CCTerminal } from "../cc-integration/pty.ts";
 import type { ChatState } from "./widgets/chat.ts";
+import {
+  createSelection,
+  startSelection,
+  updateSelection,
+  finishSelection,
+  clearSelection,
+  hasSelection,
+  selectionBounds,
+  invertRange,
+  copyToClipboard,
+  type SelectionState,
+} from "./selection.ts";
 
 // --- App state ---
 
@@ -100,9 +114,18 @@ interface AppState {
   altJFirstDigit: string; // first digit captured
   bareMode: boolean; // Alt+L: strip colors for bare display
   lag?: number; // WebSocket round-trip latency in ms
+  ccTerminals: Map<string, CCTerminal>;
+  ccActive: boolean; // true when CC buffer is focused and PTY has input
+  selection: SelectionState;
 }
 
+// Default CC session ID prefix — not removed by syncCCSessionBuffers
+const LOCAL_CC_PREFIX = "local-";
+
 function createInitialBuffers(): BufferState[] {
+  const cwd = process.cwd();
+  const project = cwd.split("/").pop() || "project";
+
   return [
     {
       channel: {
@@ -118,6 +141,27 @@ function createInitialBuffers(): BufferState[] {
       bufferType: "channel",
       cachedNickWidth: 4,
     },
+    {
+      channel: {
+        name: `⚡${project}`,
+        topic: `Claude Code — ${cwd}`,
+        members: [],
+        hotlist: emptyHotlist(),
+      },
+      messages: [],
+      chatScroll: 0,
+      readMarkerIndex: -1,
+      history: createHistory(),
+      bufferType: "cc_session",
+      cachedNickWidth: 4,
+      ccSession: {
+        id: `${LOCAL_CC_PREFIX}${project}`,
+        project,
+        cwd,
+        startedAt: Date.now(),
+        active: true,
+      },
+    },
   ];
 }
 
@@ -127,7 +171,13 @@ function syncCCSessionBuffers(state: AppState, sessions: DetectedSession[]) {
   const activeIds = new Set(sessions.map((s) => s.sessionId));
   for (let i = state.buffers.length - 1; i >= 0; i--) {
     const buf = state.buffers[i]!;
-    if (buf.bufferType === "cc_session" && buf.ccSession && !activeIds.has(buf.ccSession.id)) {
+    if (buf.bufferType === "cc_session" && buf.ccSession && !activeIds.has(buf.ccSession.id) && !buf.ccSession.id.startsWith(LOCAL_CC_PREFIX)) {
+      // Stop and clean up PTY terminal
+      const term = state.ccTerminals.get(buf.ccSession.id);
+      if (term) {
+        term.close();
+        state.ccTerminals.delete(buf.ccSession.id);
+      }
       // Adjust activeIndex if needed
       if (state.activeIndex > i) state.activeIndex--;
       else if (state.activeIndex === i) state.activeIndex = Math.max(0, i - 1);
@@ -135,12 +185,15 @@ function syncCCSessionBuffers(state: AppState, sessions: DetectedSession[]) {
     }
   }
 
-  // Add new CC session buffers
+  // Add new CC session buffers (skip if same cwd already exists as local buffer)
   for (const session of sessions) {
-    const exists = state.buffers.some(
+    const existsById = state.buffers.some(
       (b) => b.bufferType === "cc_session" && b.ccSession?.id === session.sessionId,
     );
-    if (!exists) {
+    const existsByCwd = state.buffers.some(
+      (b) => b.bufferType === "cc_session" && b.ccSession?.cwd === session.cwd,
+    );
+    if (!existsById && !existsByCwd) {
       const ccSession: CCSession = {
         id: session.sessionId,
         project: session.project,
@@ -229,6 +282,77 @@ function pushMessage(buf: BufferState, msg: Message) {
   }
 }
 
+/** Extract plain text from the selected screen region. */
+function extractSelectedText(state: AppState, layout: Layout): string | null {
+  const bounds = selectionBounds(state.selection);
+  if (!bounds) return null;
+
+  const buf = state.buffers[state.activeIndex]!;
+  const chatState: ChatState = {
+    messages: buf.messages,
+    selfNick: state.selfNick,
+    nickWidth: buf.cachedNickWidth,
+    scrollOffset: buf.chatScroll,
+    readMarkerIndex: buf.readMarkerIndex,
+    isActive: true,
+  };
+  const visibleLines = getVisibleLines(chatState, layout.chat.w, layout.chat.h);
+  const result: string[] = [];
+
+  for (let absRow = bounds.startRow; absRow <= bounds.endRow; absRow++) {
+    const chatRow = absRow - layout.chat.y;
+    if (chatRow < 0 || chatRow >= visibleLines.length) continue;
+    let line = visibleLines[chatRow]!;
+    // Trim columns for first/last row of selection
+    if (absRow === bounds.startRow && absRow === bounds.endRow) {
+      const start = Math.max(0, bounds.startCol - layout.chat.x);
+      const end = Math.max(0, bounds.endCol - layout.chat.x + 1);
+      line = line.slice(start, end);
+    } else if (absRow === bounds.startRow) {
+      const start = Math.max(0, bounds.startCol - layout.chat.x);
+      line = line.slice(start);
+    } else if (absRow === bounds.endRow) {
+      const end = Math.max(0, bounds.endCol - layout.chat.x + 1);
+      line = line.slice(0, end);
+    }
+    result.push(line.trimEnd());
+  }
+
+  return result.length > 0 ? result.join("\n") : null;
+}
+
+/** Extract text from CC session VTE buffer for the selected screen region. */
+function extractCCSelectedText(state: AppState, layout: Layout): string | null {
+  const bounds = selectionBounds(state.selection);
+  if (!bounds) return null;
+
+  const buf = state.buffers[state.activeIndex]!;
+  if (!buf.ccSession) return null;
+  const term = state.ccTerminals.get(buf.ccSession.id);
+  if (!term) return null;
+
+  const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+  const result: string[] = [];
+
+  for (let absRow = bounds.startRow; absRow <= bounds.endRow; absRow++) {
+    const chatRow = absRow - layout.chat.y;
+    if (chatRow < 0 || chatRow >= layout.chat.h) continue;
+    let line = stripAnsi(term.getLine(chatRow));
+    if (absRow === bounds.startRow && absRow === bounds.endRow) {
+      const start = Math.max(0, bounds.startCol - layout.chat.x);
+      const end = Math.max(0, bounds.endCol - layout.chat.x + 1);
+      line = line.slice(start, end);
+    } else if (absRow === bounds.startRow) {
+      line = line.slice(Math.max(0, bounds.startCol - layout.chat.x));
+    } else if (absRow === bounds.endRow) {
+      line = line.slice(0, Math.max(0, bounds.endCol - layout.chat.x + 1));
+    }
+    result.push(line.trimEnd());
+  }
+
+  return result.length > 0 ? result.join("\n") : null;
+}
+
 function buildBuflistEntries(state: AppState): BuflistEntry[] {
   return state.buffers.map((buf, i) => ({
     name: displayName(buf, state),
@@ -244,6 +368,7 @@ function handleServerMessage(
   msg: ServerMessage,
   state: AppState,
   layout: Layout,
+  scheduleRender: () => void,
 ) {
   switch (msg.type) {
     case "auth_ok": {
@@ -434,7 +559,7 @@ function handleServerMessage(
     }
   }
 
-  renderAll(layout, state);
+  scheduleRender();
 }
 
 // --- Rendering ---
@@ -471,7 +596,28 @@ function renderAll(layout: Layout, state: AppState) {
   });
 
   if (isCC && buf.ccSession) {
-    renderCCSessionPlaceholder(layout.chat, buf.ccSession);
+    const term = state.ccTerminals.get(buf.ccSession.id);
+    if (term) {
+      const sel = state.selection;
+      const sBounds = hasSelection(sel) || sel.isDragging ? selectionBounds(sel) : null;
+      for (let row = 0; row < layout.chat.h; row++) {
+        let line = row < term.rows ? term.getLine(row) : "";
+        // Apply selection overlay on CC session VTE lines
+        if (sBounds) {
+          const absRow = layout.chat.y + row;
+          if (absRow >= sBounds.startRow && absRow <= sBounds.endRow) {
+            const colStart = absRow === sBounds.startRow
+              ? Math.max(0, sBounds.startCol - layout.chat.x) : 0;
+            const colEnd = absRow === sBounds.endRow
+              ? Math.max(0, sBounds.endCol - layout.chat.x + 1) : layout.chat.w;
+            line = invertRange(line, colStart, colEnd, layout.chat.w);
+          }
+        }
+        layout.chat.writeLine(row, line);
+      }
+    } else {
+      renderCCSessionPlaceholder(layout.chat, buf.ccSession);
+    }
   } else {
     const chatState: ChatState = {
       messages: buf.messages,
@@ -480,6 +626,7 @@ function renderAll(layout: Layout, state: AppState) {
       scrollOffset: buf.chatScroll,
       readMarkerIndex: buf.readMarkerIndex,
       isActive: true,
+      selection: state.selection,
     };
     renderChat(layout.chat, chatState);
   }
@@ -490,9 +637,25 @@ function renderAll(layout: Layout, state: AppState) {
     renderNicklist(layout.nicklist, { users: state.users, scrollOffset: 0 });
   }
 
+  // Borders + cursor positioning via screen buffer
   layout.render();
-  renderInput(layout.input, state.inputState);
-  cliCursor.show();
+
+  if (state.ccActive && isCC && buf.ccSession) {
+    layout.input.writeLine(0, "");
+    const term = state.ccTerminals.get(buf.ccSession.id);
+    if (term) {
+      term.clearDirty();
+      if (term.scrollOffset === 0) {
+        layout.buffer.writeRaw(
+          `\x1b[${layout.chat.y + term.cursorRow + 1};${layout.chat.x + term.cursorCol + 1}H`,
+        );
+      }
+    }
+  } else {
+    renderInput(layout.input, state.inputState);
+  }
+
+  layout.flush();
 }
 
 // --- Main ---
@@ -504,7 +667,7 @@ export function startApp() {
     selfNick: process.env["CCC_NICK"] ?? "me",
     selfId: "",
     users: [],
-    mouseEnabled: false,
+    mouseEnabled: true,
     quitting: false,
     inputState: { text: "", cursor: 0, prompt: "[#general] " },
     completionCtx: null,
@@ -517,6 +680,9 @@ export function startApp() {
     altJPending: false,
     altJFirstDigit: "",
     bareMode: false,
+    ccTerminals: new Map(),
+    ccActive: false,
+    selection: createSelection(),
   };
 
   if (!process.stdin.isTTY) {
@@ -530,21 +696,50 @@ export function startApp() {
   }
 
   enterScreen();
+  // setEncoding('utf8') before setRawMode — ensures Node/Bun's StringDecoder
+  // buffers incomplete multi-byte sequences (Korean/CJK/emoji) across chunks,
+  // preventing the "press Enter twice" bug with Korean IME input.
+  // Adapted from Ink's App.tsx stdin setup.
+  process.stdin.setEncoding("utf8");
   process.stdin.setRawMode(true);
   process.stdin.resume();
 
   const layout = createLayout();
+  const scheduler = createRenderScheduler(() => renderAll(layout, state));
+  enableMouse();
   renderAll(layout, state);
+
+  // CC PTY render loop — debounced: wait 8ms after last data chunk before rendering
+  // so we capture CC's full TUI redraw instead of half-drawn intermediate states
+  setInterval(() => {
+    if (!state.ccActive) return;
+    const activeBuf = state.buffers[state.activeIndex];
+    if (!activeBuf?.ccSession) return;
+    const term = state.ccTerminals.get(activeBuf.ccSession.id);
+    if (!term || !term.isDirty()) return;
+    if (performance.now() - term.lastDataTime < 8) return; // wait for redraw to finish
+    term.clearDirty();
+
+    for (let row = 0; row < layout.chat.h; row++) {
+      layout.chat.writeLine(row, row < term.rows ? term.getLine(row) : "");
+    }
+    layout.render();
+    if (term.scrollOffset === 0) {
+      layout.buffer.writeRaw(
+        `\x1b[${layout.chat.y + term.cursorRow + 1};${layout.chat.x + term.cursorCol + 1}H`,
+      );
+    }
+    layout.flush();
+  }, 16);
 
   // Connect to server
   const conn = createConnection({
     onMessage(msg: ServerMessage) {
-      handleServerMessage(msg, state, layout);
+      handleServerMessage(msg, state, layout, scheduler.schedule);
     },
     onStatusChange(status: ConnectionStatus, detail?: string) {
       state.connectionStatus = status;
       if (status === "disconnected" && detail) {
-        // Show disconnect info in current buffer
         const buf = state.buffers[state.activeIndex]!;
         buf.messages.push({
           id: crypto.randomUUID(),
@@ -555,11 +750,11 @@ export function startApp() {
           type: "network",
         });
       }
-      renderAll(layout, state);
+      scheduler.schedule();
     },
     onLagUpdate(lagMs: number) {
       state.lag = lagMs;
-      renderAll(layout, state);
+      scheduler.schedule();
     },
   });
   state.connection = conn;
@@ -570,11 +765,10 @@ export function startApp() {
     if (state.connectionStatus === "connected") {
       conn.send({ type: "presence", status, rich });
     }
-    // Dynamically update CC session buffers
     if (sessions) {
       syncCCSessionBuffers(state, sessions);
     }
-    renderAll(layout, state);
+    scheduler.schedule();
   });
   presenceWatcher.start();
 
@@ -583,7 +777,9 @@ export function startApp() {
   function cleanup() {
     if (cleaned) return;
     cleaned = true;
+    scheduler.cancel();
     presenceWatcher.stop();
+    for (const term of state.ccTerminals.values()) term.close();
     conn.close();
     if (state.mouseEnabled) disableMouse();
     process.stdin.setRawMode(false);
@@ -608,21 +804,166 @@ export function startApp() {
       return;
     }
     layout.recalculate();
+    layout.invalidateAll();
+    const activeBuf = state.buffers[state.activeIndex];
+    if (activeBuf?.ccSession) {
+      const term = state.ccTerminals.get(activeBuf.ccSession.id);
+      if (term) term.resize(layout.chat.w, layout.chat.h);
+    }
     process.stdout.write("\x1b[2J");
     renderAll(layout, state);
   });
 
-  // Input loop
-  process.stdin.on("data", (data: Buffer) => {
+  // Input loop — data arrives as string because of setEncoding('utf8')
+  process.stdin.on("data", (data: string) => {
+    // CC active: forward input to PTY with mouse coordinate translation
+    if (state.ccActive) {
+      const s = data;
+      // Alt+1~9: ESC + digit → switch buffer (CCC intercepts)
+      if (s.length === 2 && s[0] === "\x1b" && s[1]! >= "1" && s[1]! <= "9") {
+        const num = parseInt(s[1]!, 10);
+        switchBuffer(state, num - 1, layout, scheduler.schedule);
+        renderAll(layout, state);
+        return;
+      }
+
+      const activeBuf = state.buffers[state.activeIndex];
+      const term = activeBuf?.ccSession
+        ? state.ccTerminals.get(activeBuf.ccSession.id)
+        : null;
+      if (!term) return;
+
+      // Parse SGR mouse events: \x1b[<btn;col;row;M/m
+      const mouseRe = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
+      let match: RegExpExecArray | null;
+      let lastIdx = 0;
+      let hasMouseEvent = false;
+      let ccScrollDelta = 0;
+
+      while ((match = mouseRe.exec(s)) !== null) {
+        hasMouseEvent = true;
+        if (match.index > lastIdx) {
+          term.write(s.slice(lastIdx, match.index));
+        }
+        lastIdx = match.index + match[0].length;
+
+        const btnNum = parseInt(match[1]!, 10);
+        const col = parseInt(match[2]!, 10);
+        const row = parseInt(match[3]!, 10);
+        const suffix = match[4]!;
+
+        if (btnNum === 64) {
+          ccScrollDelta++; // wheel up → scroll into history
+        } else if (btnNum === 65) {
+          ccScrollDelta--; // wheel down → scroll toward live
+        } else {
+          // Selection is handled by CCC directly (like tmux), not by
+          // forwarding to PTY. PTY pipe can't handle drag event volume.
+          const col0 = col - 1;
+          const row0 = row - 1;
+          const isDrag = (btnNum & 0x20) !== 0;
+          const isRelease = suffix === "m";
+          const isPress = suffix === "M" && !isDrag;
+          const bounds = {
+            buflistW: layout.buflist.w,
+            nicklistX: layout.nicklist.x,
+            statusbarY: layout.statusbar.y,
+            inputY: layout.input.y,
+          };
+          const rgn = identifyRegion(col0, row0, bounds);
+
+          if (isDrag && state.selection.isDragging) {
+            updateSelection(state.selection, col0, row0);
+            renderAll(layout, state);
+          } else if (isPress && rgn === "chat") {
+            startSelection(state.selection, col0, row0);
+          } else if (isRelease) {
+            if (hasSelection(state.selection) && state.selection.isDragging) {
+              finishSelection(state.selection);
+              const selectedText = extractCCSelectedText(state, layout);
+              if (selectedText) copyToClipboard(selectedText);
+              renderAll(layout, state);
+            } else {
+              clearSelection(state.selection);
+              // Simple click (no drag) — forward to PTY or handle buflist
+              if (rgn === "buflist") {
+                const entries = buildBuflistEntries(state);
+                const bScroll = adjustBuflistScroll(entries, state.activeIndex, 0, layout.buflist.h);
+                const clickRow = row0 - layout.buflist.y + bScroll;
+                const clicked = resolveClickedBuffer(entries, clickRow);
+                if (clicked !== null) {
+                  switchBuffer(state, clicked, layout, scheduler.schedule);
+                  renderAll(layout, state);
+                }
+              } else if (rgn === "chat") {
+                // Forward click to PTY for interactive elements
+                const newCol = col - layout.chat.x;
+                const newRow = row - layout.chat.y;
+                if (newCol >= 1 && newCol <= layout.chat.w &&
+                    newRow >= 1 && newRow <= layout.chat.h) {
+                  term.write(`\x1b[<0;${newCol};${newRow}M\x1b[<0;${newCol};${newRow}m`);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Apply VTE scrollback offset (clamped ±3 per chunk)
+      if (ccScrollDelta !== 0) {
+        const clamped = Math.sign(ccScrollDelta) * Math.min(Math.abs(ccScrollDelta), 3);
+        term.scrollOffset = Math.max(0, Math.min(term.scrollbackSize, term.scrollOffset + clamped));
+        for (let r = 0; r < layout.chat.h; r++) {
+          layout.chat.writeLine(r, term.getLine(r));
+        }
+        if (term.scrollOffset === 0) {
+          const absRow = layout.chat.y + term.cursorRow + 1;
+          const absCol = layout.chat.x + term.cursorCol + 1;
+          layout.buffer.writeRaw(`\x1b[${absRow};${absCol}H`);
+        }
+        layout.flush();
+      }
+
+      if (hasMouseEvent) {
+        if (lastIdx < s.length) term.write(s.slice(lastIdx));
+      } else {
+        // No mouse events — forward raw data as-is
+        term.write(data);
+      }
+      return;
+    }
+
+    // Normal CCC input
     const actions = parseInput(data);
+    // Normalize scroll: collapse burst of wheel events in one chunk, clamp to ±3 lines
+    let scrollDelta = 0;
     for (const action of actions) {
-      handleAction(action, layout, state);
+      if (action.type === "mouse_scroll_up") scrollDelta++;
+      else if (action.type === "mouse_scroll_down") scrollDelta--;
+      else handleAction(action, layout, state, scheduler.schedule);
+    }
+    if (scrollDelta !== 0) {
+      const buf = state.buffers[state.activeIndex]!;
+      const clamped = Math.sign(scrollDelta) * Math.min(Math.abs(scrollDelta), 3);
+      if (clamped > 0 && buf.messages.length > 0) {
+        buf.chatScroll += clamped;
+      } else if (clamped < 0) {
+        buf.chatScroll = Math.max(0, buf.chatScroll + clamped);
+        if (buf.chatScroll === 0 && buf.messages.length > 0) {
+          buf.readMarkerIndex = buf.messages.length - 1;
+        }
+      }
     }
     renderAll(layout, state);
   });
 }
 
-function switchBuffer(state: AppState, index: number) {
+function switchBuffer(
+  state: AppState,
+  index: number,
+  layout?: Layout,
+  onRender?: () => void,
+) {
   if (index < 0 || index >= state.buffers.length) return;
   const curBuf = state.buffers[state.activeIndex]!;
   if (curBuf.messages.length > 0) {
@@ -632,9 +973,43 @@ function switchBuffer(state: AppState, index: number) {
   state.buffers[index]!.channel.hotlist = emptyHotlist();
   state.inputState.prompt = `[${displayName(state.buffers[index]!, state)}] `;
   state.completionCtx = null;
+
+  const newBuf = state.buffers[index]!;
+  if (newBuf.bufferType === "cc_session" && newBuf.ccSession && layout) {
+    ensureCCTerminal(state, newBuf, layout, onRender);
+    state.ccActive = true;
+  } else {
+    state.ccActive = false;
+  }
 }
 
-function handleAction(action: Action, layout: Layout, state: AppState) {
+/** Create CC PTY terminal lazily, sized to chat region. */
+function ensureCCTerminal(
+  state: AppState,
+  buf: BufferState,
+  layout: Layout,
+  onRender?: () => void,
+) {
+  const sid = buf.ccSession!.id;
+  if (state.ccTerminals.has(sid)) return;
+
+  const term = createCCTerminal(
+    buf.ccSession!.cwd,
+    layout.chat.w,
+    layout.chat.h,
+    (code) => {
+      state.ccTerminals.delete(sid);
+      const activeBuf = state.buffers[state.activeIndex];
+      if (activeBuf?.ccSession?.id === sid) {
+        state.ccActive = false;
+        if (onRender) onRender();
+      }
+    },
+  );
+  state.ccTerminals.set(sid, term);
+}
+
+function handleAction(action: Action, layout: Layout, state: AppState, onRender?: () => void) {
   const buf = state.buffers[state.activeIndex]!;
   const isCC = buf.bufferType === "cc_session";
   const conn = state.connection;
@@ -651,7 +1026,7 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
         state.altJPending = false;
         state.altJFirstDigit = "";
         state.inputState.prompt = `[${displayName(buf, state)}] `;
-        switchBuffer(state, bufNum - 1);
+        switchBuffer(state, bufNum - 1, layout, onRender);
         return;
       }
     }
@@ -706,26 +1081,35 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
     state.completionCtx = null;
   }
 
+  // Clear selection on non-mouse actions
+  if (
+    action.type !== "mouse_press" &&
+    action.type !== "mouse_drag" &&
+    action.type !== "mouse_click" &&
+    action.type !== "mouse_scroll_up" &&
+    action.type !== "mouse_scroll_down"
+  ) {
+    clearSelection(state.selection);
+  }
+
   switch (action.type) {
     case "alt_num":
-      switchBuffer(state, action.num - 1);
+      switchBuffer(state, action.num - 1, layout, onRender);
       break;
     case "alt_left":
-      switchBuffer(state, Math.max(0, state.activeIndex - 1));
+      switchBuffer(state, Math.max(0, state.activeIndex - 1), layout, onRender);
       break;
     case "alt_right":
-      switchBuffer(state, Math.min(state.buffers.length - 1, state.activeIndex + 1));
+      switchBuffer(state, Math.min(state.buffers.length - 1, state.activeIndex + 1), layout, onRender);
       break;
 
     case "page_up":
-      if (!isCC) buf.chatScroll = Math.min(buf.chatScroll + layout.chat.h, buf.messages.length);
+      buf.chatScroll += layout.chat.h;
       break;
     case "page_down":
-      if (!isCC) {
-        buf.chatScroll = Math.max(0, buf.chatScroll - layout.chat.h);
-        if (buf.chatScroll === 0 && buf.messages.length > 0) {
-          buf.readMarkerIndex = buf.messages.length - 1;
-        }
+      buf.chatScroll = Math.max(0, buf.chatScroll - layout.chat.h);
+      if (buf.chatScroll === 0 && buf.messages.length > 0) {
+        buf.readMarkerIndex = buf.messages.length - 1;
       }
       break;
 
@@ -750,18 +1134,43 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
       state.inputState.prompt = "(search) '': ";
       break;
 
-    case "mouse_scroll_up":
-      if (!isCC) buf.chatScroll = Math.min(buf.chatScroll + 3, buf.messages.length);
-      break;
-    case "mouse_scroll_down":
-      if (!isCC) {
-        buf.chatScroll = Math.max(0, buf.chatScroll - 3);
-        if (buf.chatScroll === 0 && buf.messages.length > 0) {
-          buf.readMarkerIndex = buf.messages.length - 1;
-        }
+    // mouse_scroll_up/down: handled in input loop with normalization (not here)
+    case "mouse_press": {
+      // Start text selection in chat region
+      const pressBounds = {
+        buflistW: layout.buflist.w,
+        nicklistX: layout.nicklist.x,
+        statusbarY: layout.statusbar.y,
+        inputY: layout.input.y,
+      };
+      const pressRegion = identifyRegion(action.col, action.row, pressBounds);
+      if (pressRegion === "chat") {
+        startSelection(state.selection, action.col, action.row);
+      } else {
+        clearSelection(state.selection);
       }
       break;
+    }
+
+    case "mouse_drag": {
+      // Extend text selection
+      if (state.selection.isDragging) {
+        updateSelection(state.selection, action.col, action.row);
+      }
+      break;
+    }
+
     case "mouse_click": {
+      // Finalize selection and copy if text was selected
+      if (hasSelection(state.selection) && state.selection.isDragging) {
+        finishSelection(state.selection);
+        const selectedText = extractSelectedText(state, layout);
+        if (selectedText) copyToClipboard(selectedText);
+        // Selection remains visible until next non-mouse action
+        break;
+      }
+      clearSelection(state.selection);
+
       const bounds = {
         buflistW: layout.buflist.w,
         nicklistX: layout.nicklist.x,
@@ -776,7 +1185,7 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
         );
         const clickRow = action.row - layout.buflist.y + buflistScroll;
         const clickedEntry = resolveClickedBuffer(entries, clickRow);
-        if (clickedEntry !== null) switchBuffer(state, clickedEntry);
+        if (clickedEntry !== null) switchBuffer(state, clickedEntry, layout, onRender);
       } else if (region === "nicklist") {
         // Show rich presence of clicked user in statusbar
         const clickedRow = action.row - layout.nicklist.y;
@@ -793,6 +1202,7 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
           });
           layout.render();
           renderInput(layout.input, state.inputState);
+          layout.flush();
         }
       }
       break;
@@ -881,23 +1291,31 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
     case "enter": {
       const text = state.inputState.text.trim();
       if (!text) break;
-      if (isCC) break;
 
       historyAdd(buf.history, text);
       historyAdd(state.globalHistory, text);
 
-      if (text.startsWith("/")) {
+      // CCC-only commands: /clear, /quit, /help — work in all buffers
+      const cccCmd = text.match(/^\/(clear|quit|help)(\s|$)/)?.[1];
+      if (cccCmd === "clear") {
+        buf.messages = [];
+        buf.chatScroll = 0;
+      } else if (cccCmd === "quit") {
+        state.quitting = true;
+        state.inputState = { text: "", cursor: 0, prompt: "Really quit CCC? (y/N) " };
+        return;
+      } else if (cccCmd === "help") {
         const result = handleCommand(text, buf.channel.name);
-
-        if (text === "/clear") {
-          buf.messages = [];
-          buf.chatScroll = 0;
-        } else if (text === "/quit") {
-          state.quitting = true;
-          state.inputState = { text: "", cursor: 0, prompt: "Really quit CCC? (y/N) " };
-          return;
-        } else if (result.serverAction && conn) {
-          // Send server actions
+        if (result.messages) {
+          for (const msg of result.messages) {
+            msg.channel = buf.channel.name;
+            pushMessage(buf, msg);
+          }
+        }
+      } else if (text.startsWith("/")) {
+        // Channel/DM slash commands
+        const result = handleCommand(text, buf.channel.name);
+        if (result.serverAction && conn) {
           const sa = result.serverAction;
           switch (sa.type) {
             case "join":
@@ -906,8 +1324,7 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
             case "part":
               conn.send({ type: "part", channel: buf.channel.name, message: sa.message });
               break;
-            case "dm":
-              // Find user ID by nick
+            case "dm": {
               const target = state.users.find((u) => u.nick === sa.nick);
               if (target) {
                 conn.send({ type: "dm", to: target.id, content: sa.content });
@@ -920,6 +1337,7 @@ function handleAction(action: Action, layout: Layout, state: AppState) {
                 });
               }
               break;
+            }
             case "nick":
               conn.send({ type: "nick", nick: sa.nick });
               break;
@@ -962,8 +1380,11 @@ function resolveClickedBuffer(entries: BuflistEntry[], clickRow: number): number
     const sectionEntries = entries.filter((e) => e.bufferType === section);
     if (sectionEntries.length === 0) continue;
 
-    if (lineIndex === clickRow) return null;
-    lineIndex++;
+    // Match buildLines: cc_session has no section header
+    if (section !== "cc_session") {
+      if (lineIndex === clickRow) return null; // clicked on header
+      lineIndex++;
+    }
 
     for (const entry of sectionEntries) {
       if (lineIndex === clickRow) return entry.globalIndex;

@@ -152,10 +152,10 @@ export function renderInput(region: Region, state: InputState) {
   const line = chalk.cyan(prompt) + displayText;
   region.writeLine(0, line);
 
-  // Position hardware cursor
+  // Position hardware cursor via screen buffer
   const cursorCol =
     region.x + promptW + stringWidth(text.slice(displayStart, cursor));
-  process.stdout.write(ansiEscapes.cursorTo(cursorCol, region.y));
+  region.rawWrite(ansiEscapes.cursorTo(cursorCol, region.y));
 }
 
 // --- Input text manipulation ---

@@ -32,22 +32,25 @@ export type Action =
   | { type: "alt_l" }
   | { type: "alt_j" }
   | { type: "mouse_click"; col: number; row: number; button: number }
+  | { type: "mouse_press"; col: number; row: number; button: number }
+  | { type: "mouse_drag"; col: number; row: number; button: number }
   | { type: "mouse_scroll_up"; col: number; row: number }
   | { type: "mouse_scroll_down"; col: number; row: number }
   | { type: "unknown" };
 
-// Enable mouse reporting (SGR extended mode)
+// Enable mouse reporting — all modes for full drag/motion support
+// Adapted from Ink's dec.ts: 1000(click) + 1002(drag) + 1003(motion) + 1006(SGR)
 export function enableMouse() {
-  process.stdout.write("\x1b[?1000h\x1b[?1006h");
+  process.stdout.write("\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
 }
 
 export function disableMouse() {
-  process.stdout.write("\x1b[?1000l\x1b[?1006l");
+  process.stdout.write("\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l");
 }
 
 // Parse raw stdin data into actions
-export function parseInput(data: Buffer): Action[] {
-  const s = data.toString("utf-8");
+export function parseInput(data: Buffer | string): Action[] {
+  const s = typeof data === "string" ? data : data.toString("utf-8");
   const actions: Action[] = [];
   let i = 0;
 
@@ -62,12 +65,23 @@ export function parseInput(data: Buffer): Action[] {
         const row = parseInt(mouseMatch[3]!, 10) - 1;
         const released = mouseMatch[4] === "m";
 
+        // Bit 6 (0x40) = wheel events
         if (btn === 64) {
           actions.push({ type: "mouse_scroll_up", col, row });
         } else if (btn === 65) {
           actions.push({ type: "mouse_scroll_down", col, row });
-        } else if (btn === 0 && released) {
-          actions.push({ type: "mouse_click", col, row, button: 0 });
+        // Bit 5 (0x20) = drag/motion flag (from Mode 1002/1003)
+        } else if ((btn & 0x20) !== 0) {
+          const baseBtn = btn & 0x03;
+          actions.push({ type: "mouse_drag", col, row, button: baseBtn });
+        } else if (released) {
+          // Button release = click (M suffix = press, m suffix = release)
+          const baseBtn = btn & 0x03;
+          actions.push({ type: "mouse_click", col, row, button: baseBtn });
+        } else {
+          // Button press
+          const baseBtn = btn & 0x03;
+          actions.push({ type: "mouse_press", col, row, button: baseBtn });
         }
         i += mouseMatch[0].length;
         continue;

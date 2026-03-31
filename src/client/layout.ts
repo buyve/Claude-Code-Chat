@@ -1,10 +1,15 @@
 // Custom ANSI layout engine — 6 WeeChat-style regions
 // No blessed/ink — raw stdout + ansi-escapes + string-width
+// Renders via ScreenBuffer for diff-based flushing
 
 import ansiEscapes from "ansi-escapes";
-import stringWidth from "string-width";
 import cliCursor from "cli-cursor";
 import chalk from "chalk";
+import { createScreenBuffer, type ScreenBuffer } from "./screen-buffer.ts";
+import { fitToWidth, moveTo, stringWidth } from "./ansi-utils.ts";
+
+// Re-export for consumers (chat.ts, etc.)
+export { fitToWidth, stringWidth };
 
 export interface Rect {
   x: number;
@@ -15,81 +20,37 @@ export interface Rect {
 
 export interface Region extends Rect {
   writeLine(row: number, text: string): void;
+  writeAt(row: number, col: number, text: string): void;
   clear(): void;
   fillLine(row: number, style: (s: string) => string): void;
+  /** Append raw ANSI to the buffer output (cursor positioning, etc.) */
+  rawWrite(str: string): void;
 }
 
-// Write directly to stdout, bypassing buffering for perf
-const write = (s: string) => process.stdout.write(s);
-
-function moveTo(col: number, row: number): string {
-  return ansiEscapes.cursorTo(col, row);
-}
-
-// ANSI SGR escape sequence pattern (covers chalk output)
-const ANSI_RE = /\x1b\[[0-9;]*m/;
-
-// Truncate/pad a string to exactly `width` visible columns.
-// ANSI-aware: preserves escape sequences, appends reset on truncation.
-export function fitToWidth(text: string, width: number): string {
-  const w = stringWidth(text);
-  if (w === width) return text;
-  if (w < width) return text + " ".repeat(width - w);
-
-  // Truncate: walk the string, skip ANSI sequences, count visible chars
-  let visibleW = 0;
-  let i = 0;
-  while (i < text.length && visibleW < width) {
-    // Skip ANSI escape sequences (zero visual width)
-    if (text[i] === "\x1b") {
-      const match = text.slice(i).match(ANSI_RE);
-      if (match && text.slice(i).indexOf(match[0]) === 0) {
-        i += match[0].length;
-        continue;
-      }
-    }
-    // Measure full code-point character
-    const cp = text.codePointAt(i)!;
-    const ch = String.fromCodePoint(cp);
-    const cw = stringWidth(ch);
-    if (visibleW + cw > width) break;
-    visibleW += cw;
-    i += ch.length;
-  }
-
-  // Collect any trailing ANSI codes right after the cut point
-  let tail = "";
-  while (i < text.length && text[i] === "\x1b") {
-    const match = text.slice(i).match(ANSI_RE);
-    if (match && text.slice(i).indexOf(match[0]) === 0) {
-      tail += match[0];
-      i += match[0].length;
-    } else {
-      break;
-    }
-  }
-
-  // Reset styles to prevent color bleed into adjacent regions, then pad
-  return text.slice(0, i - (tail ? tail.length : 0)) + "\x1b[0m" + " ".repeat(width - visibleW);
-}
-
-function createRegion(rect: Rect): Region {
+function createRegion(rect: Rect, buffer: ScreenBuffer): Region {
   return {
     ...rect,
     writeLine(row: number, text: string) {
       if (row < 0 || row >= rect.h) return;
-      const fitted = fitToWidth(text, rect.w);
-      write(moveTo(rect.x, rect.y + row) + fitted);
+      buffer.writeLine(rect.x, rect.y + row, rect.w, text);
+    },
+    writeAt(row: number, col: number, text: string) {
+      if (row < 0 || row >= rect.h) return;
+      if (col < 0 || col >= rect.w) return;
+      const maxW = rect.w - col;
+      buffer.writeAt(rect.x, rect.y + row, col, maxW, text);
     },
     clear() {
-      const blank = " ".repeat(rect.w);
       for (let r = 0; r < rect.h; r++) {
-        write(moveTo(rect.x, rect.y + r) + blank);
+        buffer.writeLine(rect.x, rect.y + r, rect.w, "");
       }
     },
     fillLine(row: number, style: (s: string) => string) {
       if (row < 0 || row >= rect.h) return;
-      write(moveTo(rect.x, rect.y + row) + style(" ".repeat(rect.w)));
+      buffer.fillLine(rect.x, rect.y + row, rect.w, style(" ".repeat(rect.w)));
+    },
+    rawWrite(str: string) {
+      buffer.writeRaw(str);
     },
   };
 }
@@ -103,23 +64,22 @@ export interface Layout {
   input: Region;
   cols: number;
   rows: number;
+  buffer: ScreenBuffer;
   recalculate(): void;
   render(): void;
+  flush(): void;
+  invalidateAll(): void;
 }
 
 const MIN_COLS = 80;
 const MIN_ROWS = 24;
 const BUFLIST_W = 20;
-const NICKLIST_W = 16;
+const NICKLIST_W = 24;
 
-// Compute region rects accounting for 1-col borders between panels
 function computeRegions(cols: number, rows: number) {
-  const bodyH = rows - 3; // rows minus titlebar(1) + statusbar(1) + input(1)
-  // Buflist: 1 col narrower to leave room for left border
+  const bodyH = rows - 3;
   const blW = BUFLIST_W - 1;
-  // Nicklist: 1 col narrower to leave room for right border
   const nlW = NICKLIST_W - 1;
-  // Chat fills the middle (between two border columns)
   const chatX = BUFLIST_W;
   const chatW = cols - BUFLIST_W - NICKLIST_W;
   const nlX = cols - NICKLIST_W + 1;
@@ -137,26 +97,29 @@ function computeRegions(cols: number, rows: number) {
 export function createLayout(): Layout {
   let cols = process.stdout.columns || 80;
   let rows = process.stdout.rows || 24;
+  const buffer = createScreenBuffer(cols, rows);
 
   let rects = computeRegions(cols, rows);
-  let buflist = createRegion(rects.buflist);
-  let titlebar = createRegion(rects.titlebar);
-  let chat = createRegion(rects.chat);
-  let nicklist = createRegion(rects.nicklist);
-  let statusbar = createRegion(rects.statusbar);
-  let input = createRegion(rects.input);
+  let buflist = createRegion(rects.buflist, buffer);
+  let titlebar = createRegion(rects.titlebar, buffer);
+  let chat = createRegion(rects.chat, buffer);
+  let nicklist = createRegion(rects.nicklist, buffer);
+  let statusbar = createRegion(rects.statusbar, buffer);
+  let input = createRegion(rects.input, buffer);
 
   function recalculate() {
     cols = process.stdout.columns || 80;
     rows = process.stdout.rows || 24;
 
+    buffer.resize(cols, rows);
+
     rects = computeRegions(cols, rows);
-    buflist = createRegion(rects.buflist);
-    titlebar = createRegion(rects.titlebar);
-    chat = createRegion(rects.chat);
-    nicklist = createRegion(rects.nicklist);
-    statusbar = createRegion(rects.statusbar);
-    input = createRegion(rects.input);
+    buflist = createRegion(rects.buflist, buffer);
+    titlebar = createRegion(rects.titlebar, buffer);
+    chat = createRegion(rects.chat, buffer);
+    nicklist = createRegion(rects.nicklist, buffer);
+    statusbar = createRegion(rects.statusbar, buffer);
+    input = createRegion(rects.input, buffer);
 
     layout.buflist = buflist;
     layout.titlebar = titlebar;
@@ -169,14 +132,20 @@ export function createLayout(): Layout {
   }
 
   function render() {
-    // Draw vertical borders between regions (dedicated border columns)
+    // Draw vertical borders between regions via raw writes
     const borderChar = chalk.dim("│");
     for (let r = 1; r < rows - 2; r++) {
-      // Border between buflist and chat (col = BUFLIST_W - 1)
-      write(moveTo(BUFLIST_W - 1, r) + borderChar);
-      // Border between chat and nicklist (col = cols - NICKLIST_W)
-      write(moveTo(cols - NICKLIST_W, r) + borderChar);
+      buffer.writeRaw(moveTo(BUFLIST_W - 1, r) + borderChar);
+      buffer.writeRaw(moveTo(cols - NICKLIST_W, r) + borderChar);
     }
+  }
+
+  function flush() {
+    buffer.flush();
+  }
+
+  function invalidateAll() {
+    buffer.invalidateAll();
   }
 
   const layout: Layout = {
@@ -188,8 +157,11 @@ export function createLayout(): Layout {
     input,
     cols,
     rows,
+    buffer,
     recalculate,
     render,
+    flush,
+    invalidateAll,
   };
 
   return layout;
@@ -198,14 +170,14 @@ export function createLayout(): Layout {
 // Terminal lifecycle management
 
 export function enterScreen() {
-  write("\x1b[?1049h"); // Alternate screen buffer
-  write(ansiEscapes.clearScreen);
+  process.stdout.write("\x1b[?1049h");
+  process.stdout.write(ansiEscapes.clearScreen);
   cliCursor.hide();
 }
 
 export function exitScreen() {
   cliCursor.show();
-  write("\x1b[?1049l"); // Exit alternate screen
+  process.stdout.write("\x1b[?1049l");
 }
 
 export function isTooSmall(): boolean {
@@ -213,5 +185,3 @@ export function isTooSmall(): boolean {
   const rows = process.stdout.rows || 24;
   return cols < MIN_COLS || rows < MIN_ROWS;
 }
-
-export { stringWidth };

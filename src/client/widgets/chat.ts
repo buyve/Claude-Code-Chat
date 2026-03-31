@@ -7,6 +7,11 @@ import type { Region } from "../layout.ts";
 import { fitToWidth } from "../layout.ts";
 import type { Message, CCSession } from "../../shared/types.ts";
 import {
+  type SelectionState,
+  selectionBounds,
+  invertRange,
+} from "../selection.ts";
+import {
   getPrefix,
   nickColor,
   SELF_NICK_COLOR,
@@ -29,6 +34,7 @@ export interface ChatState {
   scrollOffset: number; // 0 = bottom (latest), positive = scrolled up
   readMarkerIndex: number; // message index where read marker sits (-1 = none)
   isActive: boolean; // is this the focused buffer?
+  selection?: SelectionState; // drag-to-select state
 }
 
 // Formatted line ready for rendering
@@ -93,11 +99,50 @@ function colorizeCode(line: string): string {
   return result;
 }
 
+/** Wrap a single line to fit within maxWidth visible columns (ANSI-aware). */
+function wrapLine(text: string, maxWidth: number): string[] {
+  if (maxWidth <= 0 || stringWidth(text) <= maxWidth) return [text];
+
+  const result: string[] = [];
+  let current = "";
+  let currentW = 0;
+  let i = 0;
+
+  while (i < text.length) {
+    // Pass through ANSI escape sequences (zero width)
+    if (text[i] === "\x1b") {
+      const match = text.slice(i).match(/^\x1b\[[0-9;]*m/);
+      if (match) {
+        current += match[0];
+        i += match[0].length;
+        continue;
+      }
+    }
+
+    const cp = text.codePointAt(i)!;
+    const ch = String.fromCodePoint(cp);
+    const cw = stringWidth(ch);
+
+    if (currentW + cw > maxWidth && current) {
+      result.push(current + "\x1b[0m");
+      current = "";
+      currentW = 0;
+    }
+
+    current += ch;
+    currentW += cw;
+    i += ch.length;
+  }
+
+  if (current) result.push(current);
+  return result;
+}
+
 /** Format content, detecting fenced code blocks and inline code. */
 function formatContentWithCodeBlocks(content: string): string[] {
-  // Single-line content without code markers — return as-is
+  // No code markers — split on newlines
   if (!content.includes("`")) {
-    return [content];
+    return content.split("\n");
   }
 
   // Handle inline code (single backticks, no newlines)
@@ -150,6 +195,7 @@ function formatMessage(
   prevMsg: Message | null,
   nickW: number,
   selfNick: string,
+  regionW: number,
 ): ChatLine[] {
   const lines: ChatLine[] = [];
 
@@ -212,8 +258,16 @@ function formatMessage(
     const paddedNick = padLeft(coloredNick, nickDisplay, nickW + 2); // +2 for < >
     const sep = SEPARATOR;
 
-    // Multi-line content (code blocks)
-    const contentLines = formatContentWithCodeBlocks(content);
+    // Multi-line content (code blocks, newlines) + word wrapping
+    const rawContentLines = formatContentWithCodeBlocks(content);
+    // Available width for content text (after time + nick + separator)
+    const prefixW = 5 + 1 + (nickW + 2) + 3; // "HH:MM" + " " + "<nick>" + " │ "
+    const contentW = Math.max(10, regionW - prefixW);
+    // Wrap each content line to fit
+    const contentLines: string[] = [];
+    for (const cl of rawContentLines) {
+      contentLines.push(...wrapLine(cl, contentW));
+    }
     const blankTime = "     ";
     const blankNick = " ".repeat(nickW + 2);
     for (let i = 0; i < contentLines.length; i++) {
@@ -250,14 +304,14 @@ function escapeRegex(s: string): string {
 }
 
 // Build all formatted lines from messages
-function buildAllLines(state: ChatState): ChatLine[] {
+function buildAllLines(state: ChatState, regionW: number): ChatLine[] {
   const lines: ChatLine[] = [];
   const { messages, nickWidth, selfNick, readMarkerIndex } = state;
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]!;
     const prev = i > 0 ? messages[i - 1]! : null;
-    const formatted = formatMessage(msg, prev, nickWidth, selfNick);
+    const formatted = formatMessage(msg, prev, nickWidth, selfNick, regionW);
     lines.push(...formatted);
 
     // Read marker after this message (width placeholder, replaced at render time)
@@ -270,10 +324,13 @@ function buildAllLines(state: ChatState): ChatLine[] {
 }
 
 export function renderChat(region: Region, state: ChatState) {
-  region.clear();
-  const allLines = buildAllLines(state);
+  const allLines = buildAllLines(state, region.w);
   const visibleRows = region.h;
   const totalLines = allLines.length;
+
+  // Clamp scroll to valid range
+  const maxScroll = Math.max(0, totalLines - visibleRows);
+  state.scrollOffset = Math.min(state.scrollOffset, maxScroll);
 
   // scrollOffset 0 = show bottom, positive = scrolled up
   const bottomIndex = totalLines;
@@ -283,39 +340,54 @@ export function renderChat(region: Region, state: ChatState) {
   const hasUp = topIndex > 0;
   const hasDown = endIndex < totalLines;
 
+  // Compute selection bounds relative to chat region (if active)
+  const sel = state.selection;
+  const bounds = sel ? selectionBounds(sel) : null;
+
   for (let row = 0; row < visibleRows; row++) {
     const lineIdx = topIndex + row;
-    if (lineIdx >= endIndex) break;
+    if (lineIdx >= endIndex) {
+      region.writeLine(row, "");
+      continue;
+    }
     const line = allLines[lineIdx]!;
+    let rendered: string;
     if (line.isReadMarker) {
-      region.writeLine(row, READ_MARKER_STYLE(READ_MARKER_CHAR.repeat(region.w)));
+      rendered = READ_MARKER_STYLE(READ_MARKER_CHAR.repeat(region.w));
     } else if (line.centered) {
       const rawLen = stringWidth(line.text);
       const pad = Math.max(0, Math.floor((region.w - rawLen) / 2));
-      region.writeLine(row, " ".repeat(pad) + line.text);
+      rendered = " ".repeat(pad) + line.text;
     } else {
-      region.writeLine(row, line.text);
+      rendered = line.text;
     }
+
+    // Apply selection overlay (SGR 7 inverse) if this row is selected
+    if (bounds) {
+      const absRow = region.y + row;
+      if (absRow >= bounds.startRow && absRow <= bounds.endRow) {
+        const colStart =
+          absRow === bounds.startRow ? Math.max(0, bounds.startCol - region.x) : 0;
+        const colEnd =
+          absRow === bounds.endRow ? Math.max(0, bounds.endCol - region.x + 1) : region.w;
+        rendered = invertRange(rendered, colStart, colEnd, region.w);
+      }
+    }
+
+    region.writeLine(row, rendered);
   }
 
-  // Scroll indicators — render at right edge so they don't destroy content
+  // Scroll indicators — overlay at right edge of first/last row
   if (hasUp) {
     const tag = SCROLL_INDICATOR(` ▲${topIndex} `);
     const tagW = stringWidth(` ▲${topIndex} `);
-    // Overwrite only the right portion of the first row
-    const col = region.x + region.w - tagW;
-    process.stdout.write(
-      `\x1b[${region.y + 1};${col + 1}H` + tag,
-    );
+    region.writeAt(0, region.w - tagW, tag);
   }
   if (hasDown) {
     const remaining = totalLines - endIndex;
     const tag = SCROLL_INDICATOR(` ▼${remaining} `);
     const tagW = stringWidth(` ▼${remaining} `);
-    const col = region.x + region.w - tagW;
-    process.stdout.write(
-      `\x1b[${region.y + visibleRows};${col + 1}H` + tag,
-    );
+    region.writeAt(visibleRows - 1, region.w - tagW, tag);
   }
 }
 
@@ -326,7 +398,6 @@ export function isAtBottom(state: ChatState): boolean {
 
 // Render CC session placeholder when a CC buffer is active
 export function renderCCSessionPlaceholder(region: Region, session: CCSession) {
-  region.clear();
   const midRow = Math.floor(region.h / 2);
 
   const title = chalk.bold.cyan(`[CC Session: ${session.project}]`);
@@ -340,20 +411,22 @@ export function renderCCSessionPlaceholder(region: Region, session: CCSession) {
     : chalk.red("○ Inactive");
 
   const border = chalk.dim("─".repeat(Math.min(40, region.w - 4)));
-  const note = chalk.dim("CC SDK integration coming in Phase 3");
+  const note = chalk.dim("Type a message to chat with Claude");
 
-  const lines = [border, "", title, status, "", cwd, lang, elapsed, "", border, "", note].filter(
+  const contentLines = [border, "", title, status, "", cwd, lang, elapsed, "", border, "", note].filter(
     (l) => l !== undefined,
   );
-  const startRow = Math.max(0, midRow - Math.floor(lines.length / 2));
+  const startRow = Math.max(0, midRow - Math.floor(contentLines.length / 2));
 
-  for (let i = 0; i < lines.length; i++) {
-    const row = startRow + i;
-    if (row >= region.h) break;
-    // Center each line
-    const lineW = stringWidth(lines[i]!);
-    const pad = Math.max(0, Math.floor((region.w - lineW) / 2));
-    region.writeLine(row, " ".repeat(pad) + lines[i]!);
+  for (let row = 0; row < region.h; row++) {
+    const ci = row - startRow;
+    if (ci >= 0 && ci < contentLines.length) {
+      const lineW = stringWidth(contentLines[ci]!);
+      const pad = Math.max(0, Math.floor((region.w - lineW) / 2));
+      region.writeLine(row, " ".repeat(pad) + contentLines[ci]!);
+    } else {
+      region.writeLine(row, "");
+    }
   }
 }
 
@@ -363,4 +436,33 @@ function formatDuration(ms: number): string {
   const hours = Math.floor(minutes / 60);
   const remainMins = minutes % 60;
   return `${hours}h ${remainMins}m ago`;
+}
+
+// Strip ANSI escape codes from a string
+function stripAnsi(s: string): string {
+  return s.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+/** Get visible plain-text lines for a given chat state (for text extraction). */
+export function getVisibleLines(
+  state: ChatState,
+  regionW: number,
+  regionH: number,
+): string[] {
+  const allLines = buildAllLines(state, regionW);
+  const totalLines = allLines.length;
+  const maxScroll = Math.max(0, totalLines - regionH);
+  const scroll = Math.min(state.scrollOffset, maxScroll);
+  const bottomIndex = totalLines;
+  const topIndex = Math.max(0, bottomIndex - regionH - scroll);
+  const endIndex = Math.min(totalLines, topIndex + regionH);
+
+  const result: string[] = [];
+  for (let i = topIndex; i < endIndex; i++) {
+    const line = allLines[i]!;
+    result.push(line.isReadMarker ? "" : stripAnsi(line.text));
+  }
+  // Pad remaining rows
+  while (result.length < regionH) result.push("");
+  return result;
 }
