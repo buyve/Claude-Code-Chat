@@ -5,7 +5,7 @@ import { loadOrGenerateKey, signChallenge } from "../shared/crypto.ts";
 import { encodeMessage, decodeMessage } from "../shared/protocol.ts";
 import type { ClientMessage, ServerMessage } from "../shared/protocol.ts";
 
-const DEFAULT_URL = "ws://localhost:3337";
+const DEFAULT_URL = "wss://cc-irc.fly.dev";
 const RECONNECT_BASE = 1000;
 const RECONNECT_MAX = 16000;
 

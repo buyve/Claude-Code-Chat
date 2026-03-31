@@ -1,31 +1,42 @@
-app = "ccc-chat"
-primary_region = "nrt"
+# fly.toml app configuration file generated for cc-irc on 2026-03-31T23:10:19+09:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'cc-irc'
+primary_region = 'nrt'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
+
+[env]
+  CCC_DB_PATH = '/data/server.db'
+  CCC_HOST = '0.0.0.0'
+  CCC_PORT = '3337'
+
+[[mounts]]
+  source = 'ccc_data'
+  destination = '/data'
 
 [[services]]
+  protocol = 'tcp'
   internal_port = 3337
-  protocol = "tcp"
 
   [[services.ports]]
     port = 443
-    handlers = ["tls", "http"]
+    handlers = ['tls', 'http']
 
   [[services.ports]]
     port = 80
-    handlers = ["http"]
+    handlers = ['http']
 
-[mounts]
-  source = "ccc_data"
-  destination = "/data"
+  [[services.tcp_checks]]
+    interval = '15s'
+    timeout = '2s'
+    grace_period = '5s'
 
-[[services.tcp_checks]]
-  grace_period = "5s"
-  interval = "15s"
-  timeout = "2s"
-
-[env]
-  CCC_PORT = "3337"
-  CCC_HOST = "0.0.0.0"
-  CCC_DB_PATH = "/data/server.db"
+[[vm]]
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 256
