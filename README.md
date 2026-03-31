@@ -92,21 +92,23 @@ Connects to the public server at `wss://cc-irc.fly.dev` automatically. No config
 ## TUI Preview
 
 ```
-┌──────────┬────────────────────────────────────┬──────────┐
-│ 📂 Chan  │ #general — General discussion      │ coding(2)│
-│ 1.#gen   │                                    │ ⚡ alice  │
-│ 2.#dev   │ [09:41] <alice> │ hey everyone!    │ ⚡ charlie│
-│          │ [09:41]   <bob> │ check this out:  │ online(1)│
-│ 💬 DMs   │         <bob> │ https://x.com/... │ ● bob    │
-│ 3.alice  │ [09:42] <alice> │ 한글 테스트 🎮   │          │
-│          │ [09:42]     --> │ charlie joined   │ offline  │
-│ ⚡ CC     │ ──────────────── (read marker)     │ ○ dave   │
-│ 4.⚡myapp │ [09:43]   <bob> │ @alice look ↑   │          │
-├──────────┴────────────────────────────────────┴──────────┤
-│ [me] │ Connected │ #general │ lag: 12ms                  │
-├──────────────────────────────────────────────────────────┤
-│ [#general] hello world█                                  │
-└──────────────────────────────────────────────────────────┘
+┌───────────┬──────────────────────────────────────────────────┬─────────────┐
+│ Channels  │  #general — Welcome to CCC                      │ -- coding --│
+│ 1.#general│                                                  │ ⚡ alice     │
+│ 2.#dev    │  [14:01]   <alice> │ just deployed the new API   │ ⚡ charlie   │
+│ 3.#ops    │  [14:02]     <bob> │ nice! any breaking changes? │             │
+│           │  [14:02]   <alice> │ nope, fully backward compat │ -- online --│
+│ DMs       │  [14:03]       --> │ charlie has joined          │ ● bob       │
+│ 4.bob     │  [14:03] <charlie> │ hey all, what did i miss?  │             │
+│           │  ──────────────────────────────────────────────── │ -- offline -│
+│ CC        │  [14:05]     <bob> │ @alice can you review       │ ○ dave      │
+│ 5.⚡myapp  │           <bob> │ https://github.com/pr/42     │             │
+│           │  [14:05]   <alice> │ on it                       │             │
+├───────────┴──────────────────────────────────────────────────┴─────────────┤
+│ [alice] │ Connected │ #general │ lag: 8ms                                  │
+├───────────────────────────────────────────────────────────────────────────-─┤
+│ [#general] looking good, merging now█                                      │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
