@@ -1341,22 +1341,20 @@ function handleAction(action: Action, layout: Layout, state: AppState, onRender?
         const clickedEntry = resolveClickedBuffer(entries, clickRow);
         if (clickedEntry !== null) switchBuffer(state, clickedEntry, layout, onRender);
       } else if (region === "nicklist") {
-        // Show rich presence of clicked user in statusbar
+        // Click on nicklist user → open DM buffer
         const clickedRow = action.row - layout.nicklist.y;
         const clickedUser = resolveNicklistClick(state.users, clickedRow, 0);
-        if (clickedRow >= 0 && clickedUser) {
-          const rich = clickedUser.richPresence;
-          const info = rich
-            ? `${clickedUser.nick} — ${rich.project}${rich.language ? ` · ${rich.language}` : ""}${rich.duration ? ` · ${rich.duration}m` : ""}`
-            : `${clickedUser.nick} — ${clickedUser.presence}`;
-          renderStatusbar(layout.statusbar, {
-            nick: state.selfNick,
-            status: info,
-            channel: displayName(buf, state),
-          });
-          layout.render();
-          renderInput(layout.input, state.inputState);
-          layout.flush();
+        if (clickedRow >= 0 && clickedUser && clickedUser.id !== state.selfId) {
+          // Send empty DM to create the DM channel, then switch to it
+          if (conn) {
+            conn.send({ type: "dm", to: clickedUser.id, content: "" });
+          }
+          // Pre-create DM buffer and switch
+          const dmChannel = [state.selfId, clickedUser.id].sort().join(":");
+          const dmName = `dm:${dmChannel}`;
+          const dmIdx = getOrCreateBuffer(state, dmName, clickedUser.nick);
+          switchBuffer(state, dmIdx, layout, onRender);
+          state.inputState.prompt = `[${clickedUser.nick}] `;
         }
       } else if (region === "chat") {
         // Click in chat: open URL if the clicked line contains one

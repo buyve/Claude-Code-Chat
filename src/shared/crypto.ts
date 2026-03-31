@@ -12,11 +12,12 @@ function sshDir(): string {
 }
 
 function keyPath(): string {
-  return join(sshDir(), KEY_NAME);
+  return process.env["CCC_KEY_PATH"] ?? join(sshDir(), KEY_NAME);
 }
 
 function pubKeyPath(): string {
-  return join(sshDir(), `${KEY_NAME}.pub`);
+  const base = process.env["CCC_KEY_PATH"];
+  return base ? `${base}.pub` : join(sshDir(), `${KEY_NAME}.pub`);
 }
 
 /** Load existing key or generate a new ed25519 keypair for CCC. */
